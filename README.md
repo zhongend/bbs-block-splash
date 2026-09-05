@@ -16,7 +16,7 @@
 | 许可证 | MIT |
 | 前置 | Minecraft **1.20.1**（精确匹配）、Fabric Loader ≥ 0.15.0、Fabric API、**BBS 模组** |
 | Java 版本 | ≥ 17 |
-| 代码规模 | 约 15,000 行 Java 源码（58 个类） + Rapier3d 原生物理库（Rust 编译） |
+| 代码规模 | 约 15,000 行 Java 源码（57 个类） + Rapier3d 原生物理库（Rust 编译） |
 | 参考项目 | [Wemppy4/bbs-fs](https://github.com/Wemppy4/bbs-fs)（BBS 模组源码，MIT）、[Sable](https://github.com/ryanhcode/sable)、[rigid-body](https://github.com/Polari-Stars-MC/rigid-body) |
 
 ---
