@@ -1,0 +1,20 @@
+{
+    "required": true,
+    "minVersion": "0.8",
+    "package": "com.example.bbsanimatedbreak.client.mixin",
+    "compatibilityLevel": "JAVA_17",
+    "client": [
+        "ClientFallingBlockEntityTickMixin",
+        "FallingBlockEntityRendererMixin",
+        "UIListAccessor",
+        "UIReplayListAccessor",
+        "UIReplayListMixin",
+        "UIReplaysListPanelAccessor",
+        "UIReplaysListPanelMixin",
+        "UIClipRenderersMixin",
+        "UIClipMixin"
+    ],
+    "injectors": {
+        "defaultRequire": 1
+    }
+}

@@ -1,0 +1,32 @@
+{
+    "schemaVersion": 1,
+    "id": "bbsblocksplash",
+    "version": "${version}",
+    "name": "bbs_Block_Splash",
+    "description": "为 BBS 添加方块飞溅行为片段，选定区域内的方块会变成下落方块实体并按指定方向飞溅，回放结束后自动恢复原状",
+    "authors": ["zhongend"],
+    "license": "MIT",
+    "environment": "*",
+    "entrypoints": {
+        "main": [
+            "com.example.bbsanimatedbreak.BlockSplashAddon"
+        ],
+        "client": [
+            "com.example.bbsanimatedbreak.client.BlockSplashClient"
+        ],
+        "bbs-addon": [
+            "com.example.bbsanimatedbreak.BlockSplashAddon"
+        ]
+    },
+    "mixins": [
+        "bbsblocksplash.mixins.json",
+        "bbsblocksplash.client.mixins.json"
+    ],
+    "depends": {
+        "fabricloader": ">=0.15.0",
+        "minecraft": "=1.20.1",
+        "java": ">=17",
+        "fabric-api": "*",
+        "bbs": "*"
+    }
+}
