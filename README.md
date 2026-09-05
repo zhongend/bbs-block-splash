@@ -4,20 +4,20 @@
 >
 > 为 [BBS 模组](https://modrinth.com/mod/bbs) 的电影/回放系统添加 **5 种方块级特效 Action Clip**：
 > 区域方块飞溅、方块振波、反向飞溅（自动建造）、方块路径运动、飞溅组合。
-> 内置 **Rapier3d 原生刚体物理引擎（JNI）** 与 **纯 Java 物理引擎双通道**，
-> 支持真实弹跳、滚动、旋转、堆叠，并且拥有**完整的存档保护机制**（动画中途退出游戏也不会破坏地图）。
+> 内置 **三档物理引擎**（Rapier3d 原生 / **BBS 物理引擎 Jolt（v2.1.0 新增）** / 原版下落方块），
+> 编辑面板一键切换，支持真实弹跳、滚动、旋转、堆叠，并且拥有**完整的存档保护机制**（动画中途退出游戏也不会破坏地图）。
 
 | 项目信息 | 内容 |
 |---|---|
 | 模组 ID | `bbsblocksplash` |
 | 模组名称 | `bbs_Block_Splash` |
-| 当前版本 | 2.0.4 |
+| 当前版本 | 2.1.0 |
 | 作者 | **zhongend** |
 | 许可证 | MIT |
 | 前置 | Minecraft **1.20.1**（精确匹配）、Fabric Loader ≥ 0.15.0、Fabric API、**BBS 模组** |
 | Java 版本 | ≥ 17 |
-| 代码规模 | 约 15,000 行 Java 源码（57 个类） + Rapier3d 原生物理库（Rust 编译） |
-| 参考项目 | [Wemppy4/bbs-fs](https://github.com/Wemppy4/bbs-fs)（BBS 模组源码，MIT）、[Sable](https://github.com/ryanhcode/sable)、[rigid-body](https://github.com/Polari-Stars-MC/rigid-body) |
+| 代码规模 | 约 15,500 行 Java 源码（60 个类） + Rapier3d / Jolt 双物理库（Rust / C++ 原生） |
+| 参考项目 | [Wemppy4/bbs-fs](https://github.com/Wemppy4/bbs-fs)（BBS 模组源码，MIT）、[Wemppy4/bbs-physics-engine](https://github.com/Wemppy4/bbs-physics-engine)（Jolt 引擎用法参照）、[Sable](https://github.com/ryanhcode/sable)、[rigid-body](https://github.com/Polari-Stars-MC/rigid-body) |
 
 ---
 
@@ -28,7 +28,7 @@
 - [3. 目录结构](#3-目录结构)
 - [4. 与 BBS 模组的对接方式](#4-与-bbs-模组的对接方式)
 - [5. 五大特效详解](#5-五大特效详解)
-- [6. 物理系统深度剖析（双引擎设计）](#6-物理系统深度剖析双引擎设计)
+- [6. 物理系统深度剖析（三引擎设计）](#6-物理系统深度剖析三引擎设计)
 - [7. 服务端调度器家族](#7-服务端调度器家族)
 - [8. Mixin 注入体系（14 个 Mixin）](#8-mixin-注入体系14-个-mixin)
 - [9. 网络同步与 165Hz 高刷新率渲染](#9-网络同步与-165hz-高刷新率渲染)
@@ -95,7 +95,7 @@ BBS（原 Blockbuster 模组的后继者）是 Minecraft 电影（machinima）�
 │                      bbsblocksplash（本插件）                             │
 │                                                                         │
 │  ┌─────────────────── 编排层（actions/）────────────────────┐            │
-│  │ BlockSplashActionClip        方块飞溅（Sable物理/原版双模式）│            │
+│  │ BlockSplashActionClip        方块飞溅（Rapier/Jolt/原版）  │            │
 │  │ BlockShockwaveActionClip     方块振波（7 种模式）           │            │
 │  │ BlockSplashReverseActionClip 反向飞溅（自动建造）           │            │
 │  │ BlockPathActionClip          路径运动（4 种样条插值）        │            │
@@ -103,14 +103,17 @@ BBS（原 Blockbuster 模组的后继者）是 Minecraft 电影（machinima）�
 │  └──────┬──────────────────────────────────────────┬───────┘            │
 │         │ 一次性规划（收集方块/算速度/记恢复）          │ 注册长期任务         │
 │  ┌──────▼──────────────────┐            ┌──────────────────▼───────────┐  │
-│  │   物理层（双引擎）        │            │  调度器层（每 tick 驱动）       │  │
+│  │   物理层（三引擎）        │            │  调度器层（每 tick 驱动）       │  │
 │  │                         │            │                              │  │
-│  │ NativePhysicsWorld      │            │ BlockShockwaveScheduler      │  │
-│  │  └─ JNI → bbs_physics   │            │ BlockSplashReverseScheduler  │  │
-│  │      (Rapier3d, Rust)   │            │ BlockPathScheduler           │  │
-│  │ PhysicsBlockEntity      │            │ BlockSplashAnimationScheduler│  │
-│  │  └─ 读刚体变换→MC实体     │            │ PhysicsWorldRegistry.tickAll │  │
-│  │ PhysicsEngine(纯Java回退)│            └──────────────────┬───────────┘  │
+│  │ PhysicsBackendWorld     │            │ BlockShockwaveScheduler      │  │
+│  │  ├─ NativePhysicsWorld  │            │ BlockSplashReverseScheduler  │  │
+│  │  │  └─ JNI → bbs_physics│            │ BlockPathScheduler           │  │
+│  │  │     (Rapier3d, Rust) │            │ BlockSplashAnimationScheduler│  │
+│  │  └─ JoltPhysicsWorld    │            │ PhysicsWorldRegistry.tickAll │  │
+│  │     └─ jolt-jni (Jolt)  │            └──────────────────┬───────────┘  │
+│  │ PhysicsBlockEntity      │                               │              │
+│  │  └─ 读刚体变换→MC实体     │                               │              │
+│  │ PhysicsEngine(纯Java回退)│                               │              │
 │  └─────────────────────────┘                               │              │
 │                                                             │              │
 │  ┌────────────────── 公共服务 ──────────────────────────────▼───────────┐  │
@@ -172,6 +175,10 @@ BlockSplashActionClip.applyAction()
 方块飞溅/
 ├── README.md                          ← 本文档
 ├── LICENSE                            ← MIT
+├── build.gradle / settings.gradle / gradle.properties ← Gradle 构建（Loom 1.15.5）
+├── gradlew / gradlew.bat / gradle/wrapper/            ← Gradle 9.2.0 wrapper
+├── buildscript/
+│   └── JoltSmokeTest.java             ← Jolt 后端独立冒烟测试（无 MC 依赖，10 项检查）
 ├── releases/
 │   ├── bbs-Block_Splash-2.0.4-sources.jar   ← 原始源码包（原始版本存档）
 │   └── MANIFEST.MF                    ← 原始构建清单（记录 Loom/Loader 版本）
@@ -189,7 +196,7 @@ BlockSplashActionClip.applyAction()
     │   ├── RegionSelectionCache.java        区域选择坐标缓存
     │   ├── RotatingFallingBlockManager.java 原版实体旋转物理管理器（681 行）
     │   ├── actions/                         五大特效 ActionClip
-    │   │   ├── BlockSplashActionClip.java         方块飞溅（814 行，最核心）
+    │   │   ├── BlockSplashActionClip.java         方块飞溅（814 行，最核心，三档引擎）
     │   │   ├── BlockShockwaveActionClip.java      方块振波
     │   │   ├── BlockSplashReverseActionClip.java  反向飞溅
     │   │   ├── BlockPathActionClip.java           路径运动
@@ -199,10 +206,13 @@ BlockSplashActionClip.applyAction()
     │   │   │   ├── IBlockFilterable.java    方块过滤器接口（精确选区传递）
     │   │   │   ├── SubEffect.java           子效果（内嵌完整 ActionClip + 时间 + 过渡曲线）
     │   │   │   └── SubEffectList.java       子效果列表
-    │   │   └── physics/                     物理子系统（11 个类）
+    │   │   └── physics/                     物理子系统（14 个类）
+    │   │       ├── PhysicsBackendWorld.java   双引擎统一接口（v2.1.0）
+    │   │       ├── JoltRuntime.java           Jolt 上下文 + native 提取加载（v2.1.0）
+    │   │       ├── JoltPhysicsWorld.java      Jolt 刚体世界（v2.1.0，BBS 物理引擎后端）
     │   │       ├── NativeLibraryLoader.java    DLL/SO/Dylib 提取加载器
     │   │       ├── NativePhysicsLibrary.java   JNI 绑定（19 个 native 方法）
-    │   │       ├── NativePhysicsWorld.java     Rapier 世界封装（AutoCloseable）
+    │   │       ├── NativePhysicsWorld.java     Rapier 世界封装（实现统一接口）
     │   │       ├── PhysicsBlockEntity.java     物理方块实体（791 行，165Hz 预测核心）
     │   │       ├── PhysicsBlockEntityTypes.java 实体类型注册
     │   │       ├── PhysicsEngine.java          纯 Java 物理引擎（Sable 风格回退）
@@ -336,7 +346,8 @@ UIClip.register(BlockPathActionClip.class,          UIBlockPathActionClip::new);
 | `rotationResetDuration` | int 40 | 5–200 tick | 角度归零动画时长 |
 | `solidify` | bool false | — | true=落地变回实体方块；false=保持动画形态，到期非线性缩小消失 |
 | `animationDuration` | double 60 | 0–9999 秒 | 非 solidify 模式的存活时长 |
-| `sable`（sableEnabled） | bool **true** | — | Sable 原生物理开关 |
+| `sable`（sableEnabled） | bool **true** | — | 旧版兼容字段（新存档请用 engine；engine 为空时由它决定 Sable/原版） |
+| `engine` | string "" | — | **物理引擎**：空=跟随 sable（旧存档兼容），`sable`=Rapier 原生，`jolt`=BBS 物理引擎（Jolt），`vanilla`=原版下落。由编辑面板「物理引擎」按钮设置 |
 | `gravityX/Y/Z` | double (0,-11,0) | ±50 m/s² | 自定义重力（-11=Sable 调校值，-9.8=现实地球，-24=月球） |
 | `linearDamping` | double 0.04 | 0–1 | 线性阻尼（越小飞得越远） |
 | `angularDamping` | double 0.3 | 0–2 | 角阻尼（越小转得越久） |
@@ -448,9 +459,72 @@ WAITING（实体悬浮在散落点等待） → RECOVERING（关闭重力，直�
 
 ---
 
-## 6. 物理系统深度剖析（双引擎设计）
+## 6. 物理系统深度剖析（三引擎设计）
 
-### 6.1 双引擎总览
+### 6.1 三引擎总览（v2.1.0 起）
+
+`block_splash` 片段的编辑面板提供 **「物理引擎」三选一切换按钮**：
+
+```
+① Sable 物理（Rapier，默认）     ② BBS 物理引擎（Jolt，v2.1.0 新增）    ③ 原版下落
+┌────────────────────────────┐   ┌────────────────────────────┐      ┌────────────────────────────┐
+│ Rapier3d (Rust) via JNI     │   │ Jolt Physics (C++) via      │      │ FallingBlockEntity 原生行为  │
+│  + PhysicsBlockEntity       │   │  jolt-jni（与               │      │  + RotatingFallingBlock     │
+│    (读刚体变换的 MC 实体)     │   │  bbs-physics-engine 同源）   │      │    Manager 注入的旋转物理     │
+│  + 纯 Java PhysicsEngine     │   │  + PhysicsBlockEntity       │      │                             │
+│    作为 JNI 失败时的兜底       │   │  （同一套实体与记录系统）      │      │                             │
+└────────────────────────────┘   └────────────────────────────┘      └────────────────────────────┘
+```
+
+三档共享完全相同的上层代码路径（采样 → 清场 → 静态碰撞注入 → 形状速度算法 → 恢复系统）——
+①② 两种刚体引擎只在世界创建与刚体调用层不同（统一抽象 `PhysicsBackendWorld`），保证切换引擎不改变效果手感；③ 用于极致性能场景。
+
+### 6.1.1 BBS 物理引擎（Jolt 后端，v2.1.0 新增）
+
+[Jolt Physics](https://github.com/jrouwe/JoltPhysics) 是《地平线：西之绝境》所用的工业级 C++ 刚体引擎，
+本插件经 stephengold 的 **jolt-jni** 绑定（`com.github.stephengold:jolt-jni-Windows64:1.0.0`，ReleaseSp 单精度）接入，
+与 [Wemppy4/bbs-physics-engine](https://github.com/Wemppy4/bbs-physics-engine) 采用**同一个物理引擎**——用法与调校也参照了它的引擎层（引擎初始化、层表、每 tick 3 子步、CCD、质量覆盖），但实现为本插件自有的适配代码（面向世界方块，而非 BBS 表单）。
+
+新增类（`actions/physics/` 包）：
+
+| 类 | 职责 |
+|---|---|
+| `PhysicsBackendWorld` | 双引擎统一接口（17 个方法：创建/移除刚体、变换读写、阻尼、步进、生命周期） |
+| `JoltRuntime` | 进程级 Jolt 上下文：native 提取加载 + `registerDefaultAllocator/newFactory/registerTypes`；**失败是正常结果**（平台不支持、缺库）→ `available()=false`，效果自动回退原版路径并只记一次日志 |
+| `JoltPhysicsWorld` | 单个 Jolt 世界（`PhysicsSystem` + 双层表 + 单线程任务系统），`AutoCloseable` |
+| （`NativePhysicsWorld`/`PhysicsWorldRegistry`/`PhysicsBlockEntity`） | 改为实现同一接口，原有 Rapier 逻辑零改动 |
+
+与 bbs-physics-engine 一致的关键调校（为什么 Jolt 后端的物理手感"对"）：
+
+| 调校 | 值 | 理由 |
+|---|---|---|
+| 单位 | 1 方块 = 1 米 | Jolt 在 10cm 以下分辨率不佳；方块作为米正好 |
+| 子步进 | 每 tick（50ms）**3 次**求解（≈60Hz） | 50ms 一步对求解器太长，3 子步是"堆叠不下沉、接触不平炸"的最廉价方案；固定值保证回放可复现 |
+| CCD | `EMotionQuality.LinearCast` | 电影方块初速高，50ms 内可飞出自身厚度数倍，只在步进端点检测会直接穿地；CCD 用百分之几的步进代价根除 |
+| 质量 | `setMass + CalculateInertia` | 按形状自动算惯性，方块翻滚手感像方块而不是质点 |
+| 求解 | 单线程 `JobSystemSingleThreaded` | Jolt 多线程结果与线程数相关；回放必须逐帧可复现 |
+| 层表 | STATIC(0)↔MOVING(1)、MOVING↔MOVING | 静态间互不检测（都推不动，纯浪费）；宽相动/静分树，静态树不随每步重建 |
+
+工程细节（避开 jolt-jni 的坑）：
+
+- **handle==0 约定**：Jolt body id 从 0 开始可能合法，而插件处处以 `handle==0` 表示"无刚体"——对外统一 `handle = bodyId + 1`，0 永不冲突。
+- **空世界检测**：`system.getNumBodies()` 含静态碰撞体（最多 2000+），不能用于 `PhysicsWorldRegistry` 的空世界销毁判定——`JoltPhysicsWorld` 自行维护动态刚体计数。
+- **零 GC 变换读取**：`getPositionAndRotation(id, rvec3, quat)` 原地填充世界级复用对象；`RVec3` 分量 getter 返回 `Object`（单精度=Float/双精度=Double），用 `Number` 中转兼容两种 native 构建。
+- **阻尼语义**：Rapier 指数衰减 `v *= exp(-rate·dt)` vs Jolt 每步 `v *= 1/(1+rate·dt)`，在 40~60 步/秒下同速率差别 <1%，插件参数（linearDamping/angularDamping）跨引擎语义一致，切换引擎无需重调参。
+- **TempAllocator 容量**：单次分配随 `MAX_BODY_PAIRS/MAX_CONTACTS` 线性放大，容量取 bbs-physics-engine 验证过的 4096/4096/2048 + 12MB（实测 65536/20480 会在步进时直接 Out of memory）。
+- **jar-in-jar 分发**：`include` ReleaseSp 构件（内嵌 `windows/x86-64/com/github/stephengold/joltjni.dll`），运行时由模组自身 ClassLoader 提取到游戏目录后 `System.load`，原子写入防多实例竞态。
+
+以上行为均由 `buildscript/JoltSmokeTest.java`（独立冒烟测试，无 MC 依赖）验证：
+native 加载、重力加速、精确落地（y=0.48）、四元数归一化、阻尼静止、自动休眠、移除后计数归零、**-25 m/s 高速方块 CCD 防穿透**，10 项全部通过。
+
+### 6.1.2 引擎切换按钮与旧存档兼容
+
+- `BlockSplashActionClip` 新增 `engine` 字符串值（`"sable"` / `"jolt"` / `"vanilla"`），UI 上为三选一循环按钮。
+- **旧存档兼容**：engine 为空（2.1.0 之前的地图数据没有这个键）时自动跟随原 `sable` 布尔字段——旧地图行为逐字节不变；一旦在面板上点击按钮即固化写入。
+- 点击任一选项会同步写 `sableEnabled`（`vanilla`→false，其余→true），保证被旧版本模组读取时行为也一致。
+- 选中 Jolt 但 native 不可用时（异构平台/缺库），自动回退原版路径并只记录一次日志，不会崩游戏。
+
+### 6.2 双引擎总览（原两档）
 
 ```
 sable=true（默认）                          sable=false
@@ -466,7 +540,7 @@ sable=true（默认）                          sable=false
 
 原生路径追求**电影级物理质量**（真实堆叠、滚动、摩擦、CCD 防穿透）；回退路径追求**零依赖兼容性**。两条路径的参数体系对齐（重力 -11 m/s² 等 Sable 调校值），切换时视觉风格一致。
 
-### 6.2 JNI 桥接层
+### 6.3 JNI 桥接层
 
 `NativePhysicsLibrary` 用 19 个 native 方法封装 Rapier 能力：
 
@@ -484,7 +558,7 @@ sable=true（默认）                          sable=false
 
 `NativePhysicsWorld` 是 `AutoCloseable` 封装（handle==0 抛异常、finalize 兜底释放）。
 
-### 6.3 物理世界生命周期（PhysicsWorldRegistry）
+### 6.4 物理世界生命周期（PhysicsWorldRegistry）
 
 Rapier 的 `pipeline.step()` 必须**每个世界每 tick 调用一次**（而非每实体一次），所以所有世界集中在注册表中，由 `END_SERVER_TICK` 统一步进（`dt=1/20`，2 子步）。
 
@@ -503,7 +577,7 @@ Rapier 的 `pipeline.step()` 必须**每个世界每 tick 调用一次**（而�
 
 > 设计权衡：世界销毁时**只清 Recording，不清 Recovery**——Recovery 是 DamageControl 失效时的存档兜底，运行时清理不安全（世界销毁时 BBS 可能还没恢复完方块）。Recovery 由 SERVER_STOPPING 的 `restoreAll + clearAll` 负责最终清理。时序上还有一条保护：刚体创建在 applyAction（同步 tick），步进在 END_SERVER_TICK，同一 tick 内刚体数必 >0，空世界检测不会误伤刚创建的世界。
 
-### 6.4 PhysicsBlockEntity（791 行，原生引擎的实体载体）
+### 6.5 PhysicsBlockEntity（791 行，双刚体引擎共用的实体载体）
 
 继承 `FallingBlockEntity` 复用其渲染器，但 **tick 完全不跑原版逻辑**——每 tick 从 Rapier 刚体读变换（位置 + 四元数）同步到实体。几个关键工程细节：
 
@@ -514,7 +588,7 @@ Rapier 的 `pipeline.step()` 必须**每个世界每 tick 调用一次**（而�
 - **客户端物理预测（165Hz 核心）**：客户端 tick 只有 20Hz 且 lerp 是直线，而物理下落是二次曲线——lerp 在 165Hz 屏幕上会"看起来 20 帧"。方案：客户端每帧用同步来的速度+重力+阻尼**自主积分预测位置与四元数旋转**，位置包到达时只做 10% 轻校正防发散。另有 **BBS 导出 i=0 帧检测**：导出时 BBS 的 RenderTickCounterMixin 每帧累加 tickDelta，i=0 表示 tick 未推进，此时陈旧速度继续积分会发散 → 检测 `tickAdvanced` 标志，未推进则跳过积分走 lerp 兜底。
 - **物理记录**：每 tick 把 (tick, blockId, 位置/速度/四元数/角速度/方块状态/休眠) 写入 `PhysicsRecordingManager`（按 replayId 分组，replayId 由 `Replay.getId()` MD5 派生，确定性），为未来的"物理烘焙成关键帧动画"功能积累数据。
 
-### 6.5 纯 Java 物理引擎（PhysicsEngine，489 行）
+### 6.6 纯 Java 物理引擎（PhysicsEngine，489 行）
 
 Sable 风格的简化刚体物理，作为原生库不可用时的兜底（也支撑振波等非 Rapier 场景）。参数全部对齐 Sable 调校：
 
@@ -540,7 +614,7 @@ Sable 风格的简化刚体物理，作为原生库不可用时的兜底（也�
 - **实体间碰撞**（`resolveEntityCollision`）：AABB vs AABB，最小穿透轴按质量倒数比例推开双方，冲量法 `j = -(1+e)·relVel / (invMassA+invMassB)` 反弹，切向摩擦 50% 衰减；用 **UUID 比较约定**（只处理 UUID 较小的一方）避免同一对碰撞被双重处理。
 - **休眠**：连续 40 tick 低速+接地 → 清零速度、精确贴合地面，停止计算。
 
-### 6.6 RotatingFallingBlockManager（681 行，原版实体的旋转物理）
+### 6.7 RotatingFallingBlockManager（681 行，原版实体的旋转物理）
 
 服务端为每个标记旋转的 `FallingBlockEntity` 维护一套轻量物理状态（三轴角速度/角度、弹跳恢复系数 0.4、地面摩擦 0.8、角阻尼 0.99/tick、质量、弹跳计数、休眠计数），由 `FallingBlockEntityPhysicsMixin` 在实体 tick 末尾驱动：
 
@@ -787,14 +861,33 @@ Sable 风格的简化刚体物理，作为原生库不可用时的兜底（也�
 
 在 IDE 里导入完整 Gradle 工程（Loom 会自动附加 Yarn 映射）后即可看到可读名；本仓库按原始版本保留 intermediary 名以忠实还原源码包。
 
-### 13.3 重新构建（要点）
+### 13.3 重新构建（build.gradle 已随仓库提供，编译已验证）
 
-本仓库保留了原始源码形态，若要重新打包：
+仓库已包含完整 Gradle 构建（`build.gradle` / `settings.gradle` / `gradle.properties` / Gradle 9.2.0 wrapper）与编译验证工具（`buildscript/`）：
 
-1. 建一个标准 Fabric 1.20.1 Loom 工程（`fabric.mod.json`、两个 mixins.json 已在 `src/main/resources`）
-2. `src/main/java` 挂入源码；依赖中加入 BBS（本地 maven 或把 bbs-fs 1.20.1 分支作为 `mavenLocal`/包含依赖构建）
-3. native 库已在 `src/main/resources/natives/windows/`，打包时会被带上
-4. `fabric.mod.json` 的 `"version": "${version}"` 由 Gradle processResources 替换，发布版本填 2.0.4
+```bash
+# 0. 准备 BBS 到本地 Maven（一次性，二选一）
+#    A. 从源码：克隆 bbs-fs 1.20.1 分支执行 gradlew publishToMavenLocal
+#    B. 现成 jar：把 BBS 1.20.1 成品 mod jar 复制为
+#       ~/.m2/repository/mchorse/bbs/2.5.2-1.20.1/bbs-2.5.2-1.20.1.jar（附最小 POM）
+
+# 1. 编译本插件（Jolt 后端依赖自动从 Maven Central 拉取并 jar-in-jar 打包）
+./gradlew build        # 产物在 build/libs/bbs-Block_Splash-2.1.0.jar
+```
+
+说明：
+- **跑 Gradle/Loom 1.15.5 需要 JDK 21**（Loom 自身的硬性要求）；但 `javac --release 17`
+  保证产物字节码仍是 Java 17——**模组运行时只要 Java 17+**
+- 源码以 **intermediary 命名**书写，`build.gradle` 因此直接以 intermediary 作为开发映射
+  （Loom 会把 Minecraft 重映射为 intermediary 名称，编译时所见即所得）
+- 本仓库源码已通过全量 javac 编译验证（`--release 17`，零错误；classpath = MC 1.20.1
+  intermediary + fabric-api 全模块（含访问加宽）+ BBS 2.5.2-1.20.1 + jolt-jni 1.0.0 +
+  fabric-loader 等，产出 73 个 class 文件）。`buildscript/AwPatch.java` 可把 fabric-api 的
+  传递性访问加宽应用到重映射后的 MC jar——手工复刻 Loom 的行为，供无 Loom 的 javac 流水线使用
+- `gradle.properties` 里 `mod_version=2.1.0`；`fabric.mod.json` 的 `"version": "${version}"` 由 processResources 注入
+- Rapier 后端的原生库 `src/main/resources/natives/windows/bbs_physics.dll` 随资源打包
+- Jolt 后端的原生库由 `include "jolt-jni-Windows64:1.0.0:ReleaseSp"` 以 Fabric jar-in-jar 嵌入产物
+- `buildscript/JoltSmokeTest.java` 是不依赖 Minecraft 的物理冒烟测试，可用任意 JDK17 直接运行（验证 native 加载与物理行为）
 
 ### 13.4 二次开发建议
 
@@ -830,6 +923,8 @@ Sable 风格的简化刚体物理，作为原生库不可用时的兜底（也�
 - **作者**：zhongend（本插件全部原创实现）
 - **[BBS 模组 / bbs-fs](https://github.com/Wemppy4/bbs-fs)**（MIT）—— 本插件的前置与 API 来源；Clip/Value/Envelope/UI 体系均出自 BBS
 - **[Sable](https://github.com/ryanhcode/sable)** —— 物理参数调校（重力 -11、阻尼体系、休眠机制）与 native 库加载方案的参考
+- **[Wemppy4/bbs-physics-engine](https://github.com/Wemppy4/bbs-physics-engine)** —— v2.1.0 新增的 Jolt 物理引擎后端与它同源（Jolt / jolt-jni），引擎层用法（层表、子步进、CCD、质量覆盖、TempAllocator 容量）参照其公开实现，面向世界方块的适配为本插件原创
+- **[Jolt Physics](https://github.com/jrouwe/JoltPhysics) / [jolt-jni](https://github.com/stephengold/jolt-jni)** —— C++ 工业级刚体引擎及其 JNI 绑定（Apache-2.0 / MIT）
 - **[rigid-body](https://github.com/Polari-Stars-MC/rigid-body)**（Polari-Stars-MC）—— Rapier3d JNI 桥接思路参考
 - **Rapier3d**（`rapier3d-f64 0.33.0`，Apache-2.0）—— Rust 刚体物理引擎
 - 原始源码包：`releases/bbs-Block_Splash-2.0.4-sources.jar`

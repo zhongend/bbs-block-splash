@@ -15,10 +15,16 @@ package com.example.bbsanimatedbreak.actions.physics;
  * - IslandManager 休眠 → 自动休眠，无悬浮
  * - CCD（连续碰撞检测）→ 高速无穿透
  */
-public class NativePhysicsWorld implements AutoCloseable
+public class NativePhysicsWorld implements PhysicsBackendWorld
 {
     private final long worldPtr;
     private boolean valid = true;
+
+    /** 每 tick 内部子步进次数（从 PhysicsWorldRegistry 移入：子步策略是后端私有调校） */
+    private static final int SUBSTEPS = 2;
+
+    /** 一个 Minecraft tick 的秒数 */
+    private static final double TICK = 1.0 / 20.0;
 
     /**
      * 创建原生物理世界（默认重力 -11.0 m/s²，Sable 调校值）
@@ -51,6 +57,18 @@ public class NativePhysicsWorld implements AutoCloseable
     public void step(double dt) {
         if (!valid) return;
         NativePhysicsLibrary.nStep(worldPtr, dt);
+    }
+
+    /**
+     * 推进一个 Minecraft tick（PhysicsBackendWorld 接口）
+     * 内部做 2 次子步进（与原 PhysicsWorldRegistry 中的策略一致，行为不变）
+     */
+    @Override
+    public void stepTick() {
+        double subDt = TICK / SUBSTEPS;
+        for (int i = 0; i < SUBSTEPS; i++) {
+            step(subDt);
+        }
     }
 
     /**

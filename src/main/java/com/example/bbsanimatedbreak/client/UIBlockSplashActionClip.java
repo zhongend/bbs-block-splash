@@ -21,6 +21,10 @@ public class UIBlockSplashActionClip extends UIActionClip<BlockSplashActionClip>
     private static final String[] SHAPE_VALUES = {"ray", "spiral", "sphere", "arc"};
     private static final String[] SHAPE_LABELS = {"射线型", "螺旋型", "球型", "弧型"};
 
+    /* 物理引擎可选项：值写入 clip.engine，标签显示在切换按钮上 */
+    private static final String[] ENGINE_VALUES = {"sable", "jolt", "vanilla"};
+    private static final String[] ENGINE_LABELS = {"Sable 物理 (Rapier)", "BBS 物理引擎 (Jolt)", "原版下落"};
+
     public UITrackpad x;
     public UITrackpad y;
     public UITrackpad z;
@@ -43,8 +47,12 @@ public class UIBlockSplashActionClip extends UIActionClip<BlockSplashActionClip>
     public UIToggle solidify;
     public UITrackpad animationDuration;
 
-    /* Sable 物理模拟开关（开启时使用 PhysicsBlockEntity 跑真实刚体物理） */
-    public UIToggle sable;
+    /* Sable 物理模拟开关（保留字段引用，实际 UI 已替换为物理引擎切换按钮） */
+    @SuppressWarnings("unused")
+    private UIToggle sable;
+
+    /* 物理引擎切换按钮（三选一循环切换） */
+    public UICirculate engine;
 
     /* 旋转相关 UI 元素引用（仅启用旋转时显示） */
     private UIElement smoothRotationLabel;
@@ -141,11 +149,22 @@ public class UIBlockSplashActionClip extends UIActionClip<BlockSplashActionClip>
         this.animationDuration = new UITrackpad((v) -> this.clip.animationDuration.set(v));
         this.animationDuration.limit(0D, 9999D);
 
-        // Sable 物理模拟开关
-        this.sable = new UIToggle(IKey.raw("Sable 物理模拟"), (toggle) ->
+        // 物理引擎切换按钮（三选一：Sable(Rapier) / BBS 物理引擎(Jolt) / 原版）
+        // 点击时同步写 engine（新字段）和 sableEnabled（旧兼容字段，供旧版本读取）
+        this.engine = new UICirculate((circulate) ->
         {
-            this.clip.sableEnabled.set(toggle.getValue());
+            int index = circulate.getValue();
+            if (index >= 0 && index < ENGINE_VALUES.length)
+            {
+                String selected = ENGINE_VALUES[index];
+                this.clip.engine.set(selected);
+                this.clip.sableEnabled.set(!"vanilla".equals(selected));
+            }
         });
+        for (String label : ENGINE_LABELS)
+        {
+            this.engine.addLabel(IKey.raw(label));
+        }
     }
 
     private void updateRotationUIVisibility(boolean visible)
@@ -337,12 +356,14 @@ public class UIBlockSplashActionClip extends UIActionClip<BlockSplashActionClip>
         // solidify 默认 false → 不实体化 → 显示动画持续时间
         this.updateSolidifyUIVisibility(true);
 
-        // Sable 物理模拟开关
-        this.panels.add(UI.label(IKey.raw("Sable 物理模拟")).marginBottom(4).marginTop(8));
-        this.panels.add(this.sable);
-        this.panels.add(UI.label(IKey.raw("开启=真实刚体物理（重力+AABB碰撞+弹跳+四元数旋转）")).marginTop(4));
-        this.panels.add(UI.label(IKey.raw("关闭=原版下落方块（仅下落+落地变方块）")).marginTop(4));
-        this.panels.add(UI.label(IKey.raw("Sable 开启时会记录每帧物理状态，供后续动画回放")).marginTop(4));
+        // 物理引擎切换
+        this.panels.add(UI.label(IKey.raw("物理引擎")).marginBottom(4).marginTop(8));
+        this.panels.add(this.engine);
+        this.panels.add(UI.label(IKey.raw("Sable=Rapier 原生刚体物理（默认）")).marginTop(4));
+        this.panels.add(UI.label(IKey.raw("BBS 引擎=Jolt 物理（与 bbs-physics-engine")).marginTop(4));
+        this.panels.add(UI.label(IKey.raw("同源：CCD 防穿透 + 60Hz 子步进求解）")).marginTop(4));
+        this.panels.add(UI.label(IKey.raw("原版=下落方块（最省性能）")).marginTop(4));
+        this.panels.add(UI.label(IKey.raw("开启物理时记录每帧状态，供后续动画回放")).marginTop(4));
 
         // 使用提示
         this.panels.add(UI.label(IKey.raw("回放结束后方块自动恢复")).marginTop(12));
@@ -399,7 +420,21 @@ public class UIBlockSplashActionClip extends UIActionClip<BlockSplashActionClip>
         }
         this.shape.setValue(shapeIndex, 1);
 
-        // Sable 物理模拟开关
-        this.sable.setValue((Boolean) this.clip.sableEnabled.get());
+        // 物理引擎切换按钮：engine 有值直接选中；为空（旧存档）按 sable 布尔推导
+        String engineValue = (String) this.clip.engine.get();
+        if (engineValue == null || engineValue.isEmpty())
+        {
+            engineValue = (Boolean) this.clip.sableEnabled.get() ? "sable" : "vanilla";
+        }
+        int engineIndex = 0;
+        for (int i = 0; i < ENGINE_VALUES.length; i++)
+        {
+            if (ENGINE_VALUES[i].equals(engineValue))
+            {
+                engineIndex = i;
+                break;
+            }
+        }
+        this.engine.setValue(engineIndex, 1);
     }
 }

@@ -45,9 +45,9 @@ public class PhysicsBlockEntity extends class_1540
     /** 最大存活 tick（60 秒） */
     private static final int MAX_LIFE = 1200;
 
-    /* === Native Rapier 刚体句柄 === */
+    /* === 物理刚体句柄与所属世界（Rapier / Jolt 双后端统一走 PhysicsBackendWorld） === */
     private long bodyHandle = 0;
-    private NativePhysicsWorld physicsWorld = null;
+    private PhysicsBackendWorld physicsWorld = null;
     private UUID worldId = null;
 
     /* === 本地保存的 BlockState（服务端构造时设置，客户端从 spawn 包同步） === */
@@ -193,15 +193,15 @@ public class PhysicsBlockEntity extends class_1540
     }
 
     /**
-     * 注入 native 刚体句柄和物理世界引用
+     * 注入刚体句柄和物理世界引用
      *
      * 由 BlockSplashActionClip 在创建刚体后调用。
      *
-     * @param handle  Rapier 刚体句柄
-     * @param world   所属原生物理世界
+     * @param handle  刚体句柄（Rapier 原生句柄 / Jolt body id+1，见 PhysicsBackendWorld）
+     * @param world   所属物理世界（Rapier / Jolt 双后端）
      * @param worldId 世界注册 ID
      */
-    public void setBodyHandle(long handle, NativePhysicsWorld world, UUID worldId)
+    public void setBodyHandle(long handle, PhysicsBackendWorld world, UUID worldId)
     {
         this.bodyHandle = handle;
         this.physicsWorld = world;

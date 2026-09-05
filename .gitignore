@@ -17,3 +17,13 @@ Thumbs.db
 # Temp
 *.log
 extracted_sources/
+libs/*.jar
+/bbs-2.*.jar
+buildscript/verify-classes/
+buildscript/cp.txt
+buildscript/*.log
+
+# 根目录意外下载的库 jar
+/*.jar
+!/releases/
+buildscript/*.class

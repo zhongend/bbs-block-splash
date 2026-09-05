@@ -1,0 +1,63 @@
+plugins {
+	id 'fabric-loom' version '1.15.5'
+}
+
+version = project.mod_version
+group = project.maven_group
+
+base {
+	archivesName = project.archives_base_name
+}
+
+repositories {
+	// BBS 不发布到公共仓库，从本地 Maven 仓库取
+	// （在 bbs-fs 检出目录执行 `gradlew publishToMavenLocal` 填充）
+	mavenLocal()
+
+	// Jolt Physics（jolt-jni）来源。Loom 会自动带上 Fabric 与 Mojang 仓库，
+	// 但不会带这个。
+	mavenCentral()
+}
+
+dependencies {
+	minecraft "com.mojang:minecraft:${project.minecraft_version}"
+	/* 本插件源码以 intermediary（中间）命名书写（与发布的 sources jar 一致），
+	 * 所以开发映射直接使用 intermediary——Loom 会把 Minecraft 重映射为
+	 * intermediary 名称，编译时所见即所得，产物无需再映射。
+	 * 注意：使用 yarn 的标准工程请先把源码 remap 回 yarn 再改回。 */
+	mappings "net.fabricmc:intermediary:${project.minecraft_version}:v2"
+	modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+	modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+
+	// 前置 BBS 模组。Loom 会把它重映射回开发映射并放到运行时 classpath。
+	modImplementation("mchorse:bbs:${project.bbs_version}") {
+		transitive = false
+	}
+
+	// Jolt Physics —— "BBS 物理引擎"后端（与 Wemppy4/bbs-physics-engine 同源引擎）。
+	// jolt-jni 各平台构件都带同一套 Java 类，取 Windows64 作为编译 API；
+	// ReleaseSp（单精度）分类器构件携带原生库，运行时才真正用。
+	// 通过 Fabric 的 jar-in-jar（include）打进 mod jar 分发。
+	implementation "com.github.stephengold:jolt-jni-Windows64:${project.jolt_version}"
+	runtimeOnly "com.github.stephengold:jolt-jni-Windows64:${project.jolt_version}:ReleaseSp"
+	include "com.github.stephengold:jolt-jni-Windows64:${project.jolt_version}:ReleaseSp"
+}
+
+processResources {
+	inputs.property "version", project.version
+
+	filesMatching("fabric.mod.json") {
+		expand "version": project.version
+	}
+}
+
+tasks.withType(JavaCompile).configureEach {
+	it.options.encoding = "UTF-8"
+	it.options.release = 17
+}
+
+java {
+	withSourcesJar()
+	sourceCompatibility = JavaVersion.VERSION_17
+	targetCompatibility = JavaVersion.VERSION_17
+}

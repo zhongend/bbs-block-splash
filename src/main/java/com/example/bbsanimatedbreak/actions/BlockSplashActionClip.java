@@ -5,7 +5,8 @@ import com.example.bbsanimatedbreak.BlockSplashRecoveryManager;
 import com.example.bbsanimatedbreak.FallingBlockRotationData;
 import com.example.bbsanimatedbreak.RotatingFallingBlockManager;
 import com.example.bbsanimatedbreak.actions.combo.IBlockFilterable;
-import com.example.bbsanimatedbreak.actions.physics.NativePhysicsWorld;
+import com.example.bbsanimatedbreak.actions.physics.JoltRuntime;
+import com.example.bbsanimatedbreak.actions.physics.PhysicsBackendWorld;
 import com.example.bbsanimatedbreak.actions.physics.PhysicsBlockEntity;
 import com.example.bbsanimatedbreak.actions.physics.PhysicsRecordingManager;
 import com.example.bbsanimatedbreak.actions.physics.PhysicsWorldRegistry;
@@ -101,16 +102,23 @@ public class BlockSplashActionClip extends ActionClip implements IBlockFilterabl
      * 默认 60 秒，上限 9999 秒 */
     public final ValueDouble animationDuration = new ValueDouble("animationDuration", 60D, 0D, 9999D);
 
-    /* 是否启用 Sable 物理模拟（默认 true）
-     * 开启时使用 PhysicsBlockEntity 跑真实的刚体物理（重力 + AABB 碰撞 + 弹跳 + 四元数旋转），
+    /* 是否启用 Sable 物理模拟（默认 true）—— 旧版兼容字段
+     * 新代码请用 engine 字段选择物理引擎；旧存档没有 engine 键时，
+     * 由本字段决定走 Sable（true）还是原版（false），保证老地图行为不变。
+     * 开启时使用 PhysicsBlockEntity 跑真实的刚体物理（重力 + 刚体碰撞 + 弹跳 + 四元数旋转），
      * 关闭时回退到原版 FallingBlockEntity（仅有简单的下落 + 落地变方块）。
-     * Sable 物理开启时会自动记录每帧状态到 PhysicsRecordingManager，供后续动画回放转换使用。 */
+     * 物理开启时会自动记录每帧状态到 PhysicsRecordingManager，供后续动画回放转换使用。 */
     public final ValueBoolean sableEnabled = new ValueBoolean("sable", true);
 
-    /* === Sable 物理自定义参数 === */
+    /* 物理引擎选择："" = 跟随 sable 布尔（旧存档兼容），"sable" = Rapier 原生，
+     * "jolt" = BBS 物理引擎（Jolt，与 bbs-physics-engine 同源），"vanilla" = 原版下落方块
+     * 由编辑面板的"物理引擎"切换按钮设置 */
+    public final ValueString engine = new ValueString("engine", "");
+
+    /* === 刚体物理自定义参数（Sable(Rapier) / Jolt 两种引擎通用） === */
 
     /* 自定义重力 Y（m/s²，向下为负，默认 -11.0 = Sable 调校值，-9.8 = 现实地球，-24 = 月球轻飘）
-     * 仅在 sable=true 时生效 */
+     * 仅在物理引擎为 Sable/Jolt 时生效 */
     public final ValueDouble gravityY = new ValueDouble("gravityY", -11.0D, -50D, 50D);
 
     /* 自定义重力 X（m/s²，通常为 0，可用于横向力效果如风） */
@@ -163,6 +171,7 @@ public class BlockSplashActionClip extends ActionClip implements IBlockFilterabl
         this.add(this.solidify);
         this.add(this.animationDuration);
         this.add(this.sableEnabled);
+        this.add(this.engine);
         this.add(this.gravityX);
         this.add(this.gravityY);
         this.add(this.gravityZ);
@@ -226,7 +235,18 @@ public class BlockSplashActionClip extends ActionClip implements IBlockFilterabl
         int rotationResetDuration = this.rotationResetDuration.get();
         boolean doSolidify = (Boolean) this.solidify.get();
         double animDurationSec = this.animationDuration.get();
-        boolean sableEnabled = (Boolean) this.sableEnabled.get();
+
+        // === 解析物理引擎 ===
+        // engine 为空（旧存档）时跟随 sable 布尔，保证老地图行为不变
+        String engine = this.resolveEngine();
+        boolean sableEnabled = !"vanilla".equals(engine);
+
+        // BBS 物理引擎（Jolt）不可用（native 缺失/平台不支持）时回退原版路径，
+        // available() 内部只记录一次日志，不刷屏
+        if ("jolt".equals(engine) && !JoltRuntime.available())
+        {
+            sableEnabled = false;
+        }
 
         // === Sable 物理记录：根据 replay id 派生确定性 UUID 作为记录分组键 ===
         // 仅当 sable 开启时分配，避免无谓的内存占用
@@ -254,7 +274,9 @@ public class BlockSplashActionClip extends ActionClip implements IBlockFilterabl
         if (sableEnabled)
         {
             // ================================================================
-            // === Sable 原生物理模式（Rapier3d） ===
+            // === 刚体物理模式（Rapier3d 原生 或 Jolt，由 engine 决定） ===
+            // 两种引擎共享同一条代码路径（PhysicsBackendWorld 统一接口），
+            // 只有世界创建那一行不同，保证效果手感完全一致
             // ================================================================
 
             // 读取自定义物理参数
@@ -267,15 +289,16 @@ public class BlockSplashActionClip extends ActionClip implements IBlockFilterabl
             int maxBlocks = this.maxPhysicsBlocks.get();
             int collRadius = this.collisionRadius.get();
 
-            // 1. 创建原生物理世界（自定义重力）
+            // 1. 创建物理世界（自定义重力，按 engine 选择 Rapier / Jolt 后端）
             // 同时传入 recordingId 和 dimensionKey，让 PhysicsWorldRegistry 在
             // 销毁世界时连带清理 PhysicsRecording 和 BlockSplashRecoveryManager 记录，
             // 修复"回放次数越多越卡"的资源泄漏。
             UUID worldId = UUID.randomUUID();
-            NativePhysicsWorld physicsWorld = PhysicsWorldRegistry.createWorld(
+            PhysicsBackendWorld physicsWorld = PhysicsWorldRegistry.createWorld(
                 worldId, gx, gy, gz,
                 recordingId,
-                world.method_27983()
+                world.method_27983(),
+                engine
             );
 
             // 2. 密度优化：大区域抽样，最多 maxBlocks 个动态方块
@@ -485,6 +508,26 @@ public class BlockSplashActionClip extends ActionClip implements IBlockFilterabl
     }
 
     /**
+     * 解析物理引擎选择
+     *
+     * engine 键为空（旧存档，没有这个键）时跟随 sableEnabled 布尔，
+     * 保证 2.1.0 之前的地图行为完全不变；否则以 engine 为准。
+     *
+     * @return "sable" / "jolt" / "vanilla"
+     */
+    public String resolveEngine()
+    {
+        String engine = (String) this.engine.get();
+
+        if (engine == null || engine.isEmpty())
+        {
+            return (Boolean) this.sableEnabled.get() ? "sable" : "vanilla";
+        }
+
+        return engine;
+    }
+
+    /**
      * 密度优化：大区域抽样，减少方块数量避免挤在一起飞溅不出去
      *
      * 方块数 ≤ maxCount 时直接返回全部。
@@ -536,7 +579,7 @@ public class BlockSplashActionClip extends ActionClip implements IBlockFilterabl
      * @param splashBlocks 飞溅方块列表（这些方块会被设为空气，不注入）
      * @param radius       注入范围（格）
      */
-    private void injectStaticCollisionBlocks(class_3218 world, NativePhysicsWorld physicsWorld,
+    private void injectStaticCollisionBlocks(class_3218 world, PhysicsBackendWorld physicsWorld,
                                               List<class_2338> splashBlocks, int radius)
     {
         Set<class_2338> splashSet = new HashSet<>(splashBlocks);

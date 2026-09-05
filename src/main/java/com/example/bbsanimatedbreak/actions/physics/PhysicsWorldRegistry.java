@@ -9,11 +9,16 @@ import net.minecraft.class_1937;
 import net.minecraft.class_5321;
 
 /**
- * 原生物理世界注册表（集中步进）
+ * 物理世界注册表（集中步进）
  *
- * Rapier 的 pipeline.step() 必须每 tick 对每个世界调用一次，
+ * 物理引擎的 pipeline.step() 必须每 tick 对每个世界调用一次，
  * 而非每实体调用一次。本注册表在服务器 tick 事件中遍历所有活跃世界，
- * 各调用一次 step(1/20)，确保物理时间正确推进。
+ * 各调用一次 stepTick()，确保物理时间正确推进。
+ *
+ * 支持两种后端（见 PhysicsBackendWorld）：
+ * - "sable"：Rapier3d 原生（NativePhysicsWorld）
+ * - "jolt" ：Jolt Physics（JoltPhysicsWorld，与 bbs-physics-engine 同源引擎）
+ * 两种后端的生命周期完全一致，由本注册表统一管理。
  *
  * 生命周期：
  * - BlockSplashActionClip.applyAction() 调用 createWorld() 创建世界
@@ -35,8 +40,8 @@ public class PhysicsWorldRegistry
     /** 世界最大存活 tick（60 秒 = 1200 tick），作为兜底超时 */
     private static final int MAX_WORLD_LIFE = 1200;
 
-    /** 活跃物理世界：worldId → 世界实例 */
-    private static final ConcurrentHashMap<UUID, NativePhysicsWorld> worlds = new ConcurrentHashMap<>();
+    /** 活跃物理世界：worldId → 世界实例（Rapier / Jolt 两种后端统一管理） */
+    private static final ConcurrentHashMap<UUID, PhysicsBackendWorld> worlds = new ConcurrentHashMap<>();
 
     /** 世界创建时的 tick 计数（用于超时销毁） */
     private static final ConcurrentHashMap<UUID, Integer> worldAges = new ConcurrentHashMap<>();
@@ -98,37 +103,65 @@ public class PhysicsWorldRegistry
     /**
      * 查询已注册的世界
      */
-    public static NativePhysicsWorld getWorld(UUID id)
+    public static PhysicsBackendWorld getWorld(UUID id)
     {
         return worlds.get(id);
     }
 
     /**
-     * 物理子步进次数（每 tick 内部分 N 次步进，提高碰撞和旋转精度）
+     * 创建并注册物理世界（按引擎选择 Rapier / Jolt 后端），并关联 recordingId 和 dimensionKey
      *
-     * 性能考量：子步进让 CPU 开销线性增长，但能显著提升物理精度
-     * （碰撞响应、堆叠稳定性、旋转平滑度）。
-     * 物理质量优先，保留 SUBSTEPS=2。性能优化通过其他手段实现
-     * （并行步进、批量 JNI、异步线程）。
+     * @param engine "sable"=Rapier 原生（默认），"jolt"=BBS 物理引擎（Jolt）
      */
-    private static final int SUBSTEPS = 2;
+    public static PhysicsBackendWorld createWorld(UUID id, double gx, double gy, double gz,
+                                                  UUID recordingId, class_5321<class_1937> dimensionKey,
+                                                  String engine)
+    {
+        PhysicsBackendWorld world;
+
+        if ("jolt".equals(engine))
+        {
+            world = new JoltPhysicsWorld(gx, gy, gz);
+        }
+        else
+        {
+            world = new NativePhysicsWorld(gx, gy, gz);
+        }
+
+        worlds.put(id, world);
+        worldAges.put(id, 0);
+
+        if (recordingId != null)
+        {
+            worldRecordingMap.put(id, recordingId);
+        }
+        if (dimensionKey != null)
+        {
+            worldDimensionMap.put(id, dimensionKey);
+        }
+        return world;
+    }
+
+    /**
+     * 物理子步进策略已移入各后端实现（NativePhysicsWorld 2 子步 / JoltPhysicsWorld 3 子步），
+     * 本注册表只负责统一的每 tick 驱动与生命周期管理。
+     */
 
     /**
      * 步进所有活跃世界（由服务器 tick 事件调用）
      *
-     * 使用子步进（substeps）：每 tick 内部将 dt 分成 SUBSTEPS 次小步长，
-     * 每次 step(dt/SUBSTEPS)。这样物理模拟更精确，碰撞响应和旋转更平滑。
+     * 每个世界调用一次 stepTick()，由后端自行完成内部子步进。
      *
-     * @param dt 时间步长（秒），通常 1/20
+     * @param dt 时间步长（秒），保留参数以兼容旧调用方，子步细节由后端处理
      */
     public static void tickAll(double dt)
     {
-        Iterator<Map.Entry<UUID, NativePhysicsWorld>> it = worlds.entrySet().iterator();
+        Iterator<Map.Entry<UUID, PhysicsBackendWorld>> it = worlds.entrySet().iterator();
         while (it.hasNext())
         {
-            Map.Entry<UUID, NativePhysicsWorld> e = it.next();
+            Map.Entry<UUID, PhysicsBackendWorld> e = it.next();
             UUID id = e.getKey();
-            NativePhysicsWorld world = e.getValue();
+            PhysicsBackendWorld world = e.getValue();
 
             // 世界已失效，移除
             if (!world.isValid())
@@ -168,12 +201,8 @@ public class PhysicsWorldRegistry
                 continue;
             }
 
-            // 子步进：将 dt 分成 SUBSTEPS 次小步长
-            double subDt = dt / SUBSTEPS;
-            for (int i = 0; i < SUBSTEPS; i++)
-            {
-                world.step(subDt);
-            }
+            // 子步进由后端 stepTick() 内部完成（Rapier 2 子步 / Jolt 3 子步）
+            world.stepTick();
 
             // 超时销毁
             int age = worldAges.merge(id, 1, Integer::sum);
@@ -218,7 +247,7 @@ public class PhysicsWorldRegistry
      */
     public static void destroyWorld(UUID id)
     {
-        NativePhysicsWorld world = worlds.remove(id);
+        PhysicsBackendWorld world = worlds.remove(id);
         worldAges.remove(id);
         if (world != null && world.isValid())
         {
@@ -240,7 +269,7 @@ public class PhysicsWorldRegistry
      */
     public static void clearAll()
     {
-        for (NativePhysicsWorld world : worlds.values())
+        for (PhysicsBackendWorld world : worlds.values())
         {
             if (world.isValid())
             {

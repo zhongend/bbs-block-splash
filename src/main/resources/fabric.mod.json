@@ -3,7 +3,7 @@
     "id": "bbsblocksplash",
     "version": "${version}",
     "name": "bbs_Block_Splash",
-    "description": "为 BBS 添加方块飞溅行为片段，选定区域内的方块会变成下落方块实体并按指定方向飞溅，回放结束后自动恢复原状",
+    "description": "为 BBS 添加方块飞溅行为片段，选定区域内的方块会变成下落方块实体并按指定方向飞溅，回放结束后自动恢复原状。支持 Rapier3d 原生 / Jolt（BBS 物理引擎）/ 原版三档物理引擎切换",
     "authors": ["zhongend"],
     "license": "MIT",
     "environment": "*",
