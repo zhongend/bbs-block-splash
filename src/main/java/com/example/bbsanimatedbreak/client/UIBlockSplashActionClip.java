@@ -474,7 +474,7 @@ public class UIBlockSplashActionClip extends UIActionClip<BlockSplashActionClip>
             return;
         }
 
-        PhysicsBaker.Result result = PhysicsBaker.bakeAll(film, BakeOptions.bakeDefaults());
+        PhysicsBaker.Result result = PhysicsBaker.bakeToDocument(film, BakeOptions.bakeDefaults());
 
         this.bakeStatus.label = IKey.raw(result.message);
         System.out.println("[BBS-Splash] Bake: " + result.message

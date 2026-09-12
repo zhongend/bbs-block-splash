@@ -11,7 +11,7 @@
 |---|---|
 | 模组 ID | `bbsblocksplash` |
 | 模组名称 | `bbs_Block_Splash` |
-| 当前版本 | 2.3.0 |
+| 当前版本 | 2.4.0 |
 | 作者 | **zhongend** |
 | 许可证 | MIT |
 | 前置 | Minecraft **1.20.1**（精确匹配）、Fabric Loader ≥ 0.15.0、Fabric API、**BBS 模组** |

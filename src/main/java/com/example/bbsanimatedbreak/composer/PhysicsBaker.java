@@ -12,6 +12,8 @@ import mchorse.bbs_mod.forms.forms.BlockForm;
 import mchorse.bbs_mod.settings.values.base.BaseValue;
 import mchorse.bbs_mod.utils.keyframes.KeyframeChannel;
 import mchorse.bbs_mod.utils.pose.Transform;
+import com.example.bbsanimatedbreak.composer.anim.AnimationDocumentStore;
+import com.example.bbsanimatedbreak.composer.anim.BlockSplashAnimationDocument;
 
 /**
  * 物理烘焙器 —— 规范 §29-38
@@ -241,6 +243,188 @@ public final class PhysicsBaker
         }
 
         return new Result(blocks, raw, keys, skipped, positionError, rotationError, millis, message);
+    }
+
+    /**
+     * 把物理轨迹烘焙进**独立的 Block Splash 动画文档**（规范 §三十）
+     *
+     * 这是 3.0 的**默认**烘焙路径。上一轮"直接写 BBS 原生 Replay"的实现之所以被
+     * 替换，是因为它违反了这条规范最核心的区分（§一/§四十二）：
+     *
+     *     BBS Native K-Frame 不等于 Block Splash K-Frame
+     *
+     * 3000 个方块的轨道塞进原版编辑器，会让原版时间轴不可用（§五十七）。
+     * 所以：烘焙进独立文档；"导出到 BBS 原生"是显式的高级操作（§五十六）。
+     *
+     * Re-Bake 语义（规范 §三十八~§四十）：每次烘焙都新建一个 Physics 图层
+     * （Physics Bake 001 / 002...），不覆盖手工编辑 —— 非破坏式工作流。
+     */
+    public static Result bakeToDocument(Film film, BakeOptions options)
+    {
+        String filmId = film == null ? null : film.getId();
+
+        List<TrajectoryStore.Set> sets = TrajectoryStore.forFilm(filmId);
+
+        if (sets.isEmpty())
+        {
+            return fail("没有可烘焙的轨迹 —— 先播放一次含物理的片段，再回来点烘焙");
+        }
+
+        final BakeOptions opts = options == null ? BakeOptions.bakeDefaults() : options;
+
+        long start = System.currentTimeMillis();
+
+        BlockSplashAnimationDocument doc = AnimationDocumentStore.getOrCreate(filmId, filmId);
+
+        /* Re-Bake = 新图层（规范 §四十） */
+        int bakeIndex = 1;
+
+        for (BlockSplashAnimationDocument.AnimationLayer layer : doc.layers)
+        {
+            if (layer.kind == BlockSplashAnimationDocument.LAYER_PHYSICS && layer.bakeIndex >= bakeIndex)
+            {
+                bakeIndex = layer.bakeIndex + 1;
+            }
+        }
+
+        int layerIndex = doc.addLayer(
+            "Physics Bake " + String.format("%03d", bakeIndex),
+            BlockSplashAnimationDocument.LAYER_PHYSICS, bakeIndex);
+
+        doc.duration = 0;
+
+        int blocks = 0;
+        int keys = 0;
+        int raw = 0;
+        double positionError = 0D;
+        double rotationError = 0D;
+
+        for (TrajectoryStore.Set set : sets)
+        {
+            TrajectoryBuffer buffer = set.buffer;
+
+            if (buffer == null || buffer.size() == 0)
+            {
+                continue;
+            }
+
+            int[] order = buffer.compactByBody();
+
+            for (int b = 0; b < set.tracks.size(); b++)
+            {
+                TrajectoryStore.Track track = set.tracks.get(b);
+
+                if (track == null)
+                {
+                    continue;
+                }
+
+                int from = buffer.firstSampleOf(b);
+                int to = from + buffer.samplesOf(b);
+
+                MotionSimplifier.Result result = MotionSimplifier.simplify(
+                    buffer, order, from, to,
+                    opts.positionError, opts.rotationErrorRadians());
+
+                if (result.indices.length == 0)
+                {
+                    continue;
+                }
+
+                BlockSplashAnimationDocument.BlockTrack out =
+                    new BlockSplashAnimationDocument.BlockTrack();
+
+                out.layer = layerIndex;
+                out.stableBlockId = track.stableBlockId;
+                out.sourceX = track.blockX;
+                out.sourceY = track.blockY;
+                out.sourceZ = track.blockZ;
+                out.blockState = track.blockState;
+                out.sourceLabel = "Physics Bake " + String.format("%03d", bakeIndex);
+                out.backendLabel = set.backend;
+
+                int n = result.indices.length;
+
+                out.posTick = new float[n];
+                out.posX = new double[n];
+                out.posY = new double[n];
+                out.posZ = new double[n];
+                out.posSource = new byte[n];
+                out.posInterp = new byte[n];
+
+                out.rotTick = new float[n];
+                out.rotX = new float[n];
+                out.rotY = new float[n];
+                out.rotZ = new float[n];
+                out.rotW = new float[n];
+                out.rotSource = new byte[n];
+                out.rotInterp = new byte[n];
+
+                for (int k = 0; k < n; k++)
+                {
+                    int sample = order[result.indices[k]];
+                    float tick = buffer.tickAt(sample);
+
+                    out.posTick[k] = tick;
+                    out.posX[k] = buffer.posX(sample);
+                    out.posY[k] = buffer.posY(sample);
+                    out.posZ[k] = buffer.posZ(sample);
+                    out.posSource[k] = BlockSplashAnimationDocument.SOURCE_PHYSICS;
+                    out.posInterp[k] = BlockSplashAnimationDocument.INTERP_LINEAR;
+
+                    out.rotTick[k] = tick;
+
+                    /* 归一化：长轨迹插值会放大轻微的非单位四元数误差 */
+                    Quaternionf quat = new Quaternionf(
+                        buffer.rotX(sample), buffer.rotY(sample),
+                        buffer.rotZ(sample), buffer.rotW(sample)).normalize();
+
+                    out.rotX[k] = quat.x;
+                    out.rotY[k] = quat.y;
+                    out.rotZ[k] = quat.z;
+                    out.rotW[k] = quat.w;
+                    out.rotSource[k] = BlockSplashAnimationDocument.SOURCE_PHYSICS;
+                    out.rotInterp[k] = BlockSplashAnimationDocument.INTERP_LINEAR;
+
+                    if (tick > doc.duration)
+                    {
+                        doc.duration = (int) Math.ceil(tick);
+                    }
+                }
+
+                doc.tracks.add(out);
+
+                blocks++;
+                keys += n;
+                raw += result.rawSamples;
+
+                if (result.maxPositionError > positionError) positionError = result.maxPositionError;
+                if (result.maxRotationError > rotationError) rotationError = result.maxRotationError;
+            }
+        }
+
+        if (blocks <= 0)
+        {
+            return fail("没有可烘焙的方块轨迹");
+        }
+
+        try
+        {
+            AnimationDocumentStore.save(filmId, doc);
+        }
+        catch (Exception e)
+        {
+            return fail("文档已生成但保存失败: " + e);
+        }
+
+        long millis = System.currentTimeMillis() - start;
+
+        String message = "烘焙 " + blocks + " 个方块 / " + keys + " 个关键帧"
+            + "（原始 " + raw + " 样本，压缩比 "
+            + String.format("%.1f%%", raw == 0 ? 100F : keys * 100F / raw) + "）到 "
+            + doc.layers.get(layerIndex).name;
+
+        return new Result(blocks, raw, keys, 0, positionError, rotationError, millis, message);
     }
 
     /** 烘焙失败时的空结果 */
