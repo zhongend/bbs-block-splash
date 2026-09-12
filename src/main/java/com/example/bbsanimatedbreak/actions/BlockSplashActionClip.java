@@ -5,6 +5,8 @@ import com.example.bbsanimatedbreak.BlockSplashRecoveryManager;
 import com.example.bbsanimatedbreak.FallingBlockRotationData;
 import com.example.bbsanimatedbreak.RotatingFallingBlockManager;
 import com.example.bbsanimatedbreak.actions.combo.IBlockFilterable;
+import com.example.bbsanimatedbreak.composer.Deterministic;
+import com.example.bbsanimatedbreak.composer.TrajectoryStore;
 import com.example.bbsanimatedbreak.actions.physics.JoltRuntime;
 import com.example.bbsanimatedbreak.actions.physics.PhysicsBackendWorld;
 import com.example.bbsanimatedbreak.actions.physics.PhysicsBlockEntity;
@@ -316,6 +318,24 @@ public class BlockSplashActionClip extends ActionClip implements IBlockFilterabl
 
             PhysicsBackendWorld physicsWorld = entry.world;
 
+            // 1.5 3.0 Physics Bake：为这次模拟建立一套**全新**的轨迹仓库
+            //
+            //   - 走到这里说明物理世界是新建的（上面 has() 已做幂等短路），
+            //     所以轨迹必须从零开始 —— 复用旧轨迹会把上一次模拟的样本
+            //     和这一次的混在一起，烘焙出来就是两段轨迹的叠加。
+            //   - 种子由 worldKey 派生：同一片段永远同一串随机数（规范 §67）。
+            //   - 轨迹仓库**独立于物理世界**存活（规范 §21）：物理世界在回放停止时
+            //     会被销毁，但作者要的是"播完之后再点烘焙"，所以轨迹必须留下来。
+            TrajectoryStore.clear(worldKey);
+
+            TrajectoryStore.Set trajectory = TrajectoryStore.begin(
+                worldKey,
+                film == null ? "?" : film.getId(),
+                replay == null ? "?" : replay.getId(),
+                this.tick.get(),
+                Deterministic.hashString(worldKey),
+                engine);
+
             // 2. 密度优化：大区域抽样，最多 maxBlocks 个动态方块
             List<class_2338> sampledBlocks = this.sampleBlocksForDensity(blocks, maxBlocks);
             int totalBlocks = sampledBlocks.size();
@@ -424,6 +444,12 @@ public class BlockSplashActionClip extends ActionClip implements IBlockFilterabl
 
                     // 保存初始条件：向后拖动时间轴时物理不可"倒算"，
                     // 需要据此重建刚体并重新模拟到目标 tick（结果确定性一致）
+
+                    // 3.0 Physics Bake：为这个刚体登记一条轨迹槽
+                    // dense index = bodies 的下标（规范 §68：不用 HashMap，用整数索引）
+                    TrajectoryStore.declare(trajectory, entry.bodies.size(),
+                        pos.method_10263(), pos.method_10264(), pos.method_10260(), state);
+
                     entry.bodies.add(new PhysicsWorldRegistry.BodyBinding(
                         physics,
                         pos.method_10263() + 0.5,

@@ -2,6 +2,10 @@ package com.example.bbsanimatedbreak.client;
 
 import com.example.bbsanimatedbreak.RegionSelectionCache;
 import com.example.bbsanimatedbreak.actions.BlockSplashActionClip;
+import com.example.bbsanimatedbreak.composer.BakeOptions;
+import com.example.bbsanimatedbreak.composer.PhysicsBaker;
+import com.example.bbsanimatedbreak.composer.TrajectoryStore;
+import mchorse.bbs_mod.film.Film;
 import mchorse.bbs_mod.l10n.keys.IKey;
 import mchorse.bbs_mod.ui.film.IUIClipsDelegate;
 import mchorse.bbs_mod.ui.film.clips.actions.UIActionClip;
@@ -10,6 +14,7 @@ import mchorse.bbs_mod.ui.framework.elements.buttons.UIButton;
 import mchorse.bbs_mod.ui.framework.elements.buttons.UICirculate;
 import mchorse.bbs_mod.ui.framework.elements.buttons.UIToggle;
 import mchorse.bbs_mod.ui.framework.elements.input.UITrackpad;
+import mchorse.bbs_mod.ui.framework.elements.utils.UILabel;
 import mchorse.bbs_mod.ui.utils.UI;
 import net.minecraft.class_2338;
 
@@ -42,6 +47,10 @@ public class UIBlockSplashActionClip extends UIActionClip<BlockSplashActionClip>
     public UITrackpad rotationStopDistance;
     public UITrackpad rotationResetDuration;
     public UIButton pasteCoords;
+
+    /* 3.0 Physics Bake：把物理轨迹烘焙成 BBS 原生逐方块关键帧 */
+    public UIButton bake;
+    public UILabel bakeStatus;
 
     /* 方块实体化开关 + 动画持续时间 */
     public UIToggle solidify;
@@ -135,6 +144,14 @@ public class UIBlockSplashActionClip extends UIActionClip<BlockSplashActionClip>
         {
             this.pasteSelectedCoords();
         });
+
+        // 3.0 Physics Bake：烘焙按钮
+        this.bake = new UIButton(IKey.raw("烘焙物理 → 关键帧"), (btn) ->
+        {
+            this.bakeToKeyframes();
+        });
+
+        this.bakeStatus = UI.label(IKey.raw("先播放一次该片段，再点烘焙"));
 
         // 方块实体化开关（true=飞溅后变回实体方块，false=保持动画形式后缩小消失）
         this.solidify = new UIToggle(IKey.raw("方块实体化"), (toggle) ->
@@ -274,6 +291,9 @@ public class UIBlockSplashActionClip extends UIActionClip<BlockSplashActionClip>
         // 粘贴坐标按钮
         this.panels.add(UI.label(IKey.raw("快捷操作")).marginBottom(4).marginTop(8));
         this.panels.add(this.pasteCoords);
+
+        this.panels.add(this.bake);
+        this.panels.add(this.bakeStatus);
         this.panels.add(UI.label(IKey.raw("提示：先从创造栏拿")).marginTop(4));
         this.panels.add(UI.label(IKey.raw("\"方块飞溅区域选择木棍\"")).marginTop(4));
         this.panels.add(UI.label(IKey.raw("左键选第一个点，右键选第二个点")).marginTop(4));
@@ -437,4 +457,30 @@ public class UIBlockSplashActionClip extends UIActionClip<BlockSplashActionClip>
         }
         this.engine.setValue(engineIndex, 1);
     }
+    /**
+     * 3.0 Physics Bake：把本影片的物理轨迹烘焙成 BBS 原生逐方块关键帧
+     *
+     * 走的是客户端编辑链路 —— editor.getFilm() 返回的就是作者正在编辑的那个 Film，
+     * 烘焙出来的 Replay 会立刻出现在回放列表里，并随 BBS 正常的保存流程持久化。
+     * 规范 §45：烘焙后这些轨道就是普通 BBS 动画，不需要本插件在场也能播放。
+     */
+    private void bakeToKeyframes()
+    {
+        Film film = this.editor == null ? null : this.editor.getFilm();
+
+        if (film == null)
+        {
+            this.bakeStatus.label = IKey.raw("没有打开的影片");
+            return;
+        }
+
+        PhysicsBaker.Result result = PhysicsBaker.bakeAll(film, BakeOptions.bakeDefaults());
+
+        this.bakeStatus.label = IKey.raw(result.message);
+        System.out.println("[BBS-Splash] Bake: " + result.message
+            + " | 误差 位置=" + String.format("%.4f", result.maxPositionError)
+            + " 旋转=" + String.format("%.3f", result.maxRotationError) + "°"
+            + " | 耗时 " + result.millis + "ms");
+    }
+
 }

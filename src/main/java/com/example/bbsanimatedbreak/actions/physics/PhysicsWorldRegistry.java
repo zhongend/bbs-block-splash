@@ -1,5 +1,7 @@
 package com.example.bbsanimatedbreak.actions.physics;
 
+import com.example.bbsanimatedbreak.composer.TrajectoryStore;
+
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
@@ -115,6 +117,15 @@ public final class PhysicsWorldRegistry
 
         public final List<BodyBinding> bodies = new ArrayList<>();
         public boolean destroyed = false;
+
+        /* === 轨迹采集的复用缓冲（3.0 Physics Bake）===
+         *
+         * JNI 读取必须写进调用方提供的数组 —— 这是本仓库"JNI 零分配"铁律的延续
+         * （规范 §71：500 方块 × 20 tick ≈ 30,000 临时数组/秒会引发 GC 风暴）。
+         * 每个 Entry 一份，driveTo 单线程调用，无需同步。
+         */
+        double[] trajPos = new double[3];
+        float[] trajRot = new float[4];
 
         Entry(String key, UUID worldId, PhysicsBackendWorld world,
               double gx, double gy, double gz, UUID recordingId,
@@ -297,6 +308,39 @@ public final class PhysicsWorldRegistry
 
             entry.world.stepTick();
             entry.simulatedTick++;
+
+            /* === 轨迹采集（3.0 Physics Bake）===
+             *
+             * 必须紧跟在 stepTick 之后：这一步读到的就是"该 tick 的权威样本"。
+             * 采集器自己决定要不要存（静止段折叠），所以这里只管喂数据，
+             * 不在热路径上做任何判断 —— 判断逻辑在 TrajectoryBuffer.capture 里，
+             * 而且用的是原始数组比较，没有对象分配。
+             *
+             * 没有轨迹仓库（未开始烘焙流程）时直接跳过，开销为零。
+             */
+            TrajectoryStore.Set set = TrajectoryStore.get(key);
+
+            if (set != null && set.buffer != null)
+            {
+                int bodyCount = Math.min(entry.bodies.size(), set.buffer.bodyCount());
+
+                for (int b = 0; b < bodyCount; b++)
+                {
+                    BodyBinding binding = entry.bodies.get(b);
+
+                    if (binding == null || binding.handle == 0)
+                    {
+                        continue;
+                    }
+
+                    entry.world.getBodyTransform(binding.handle, entry.trajPos, entry.trajRot);
+
+                    set.buffer.capture(b, entry.simulatedTick,
+                        entry.trajPos[0], entry.trajPos[1], entry.trajPos[2],
+                        entry.trajRot[0], entry.trajRot[1], entry.trajRot[2], entry.trajRot[3],
+                        0D, 0D, 0D, 0, false);
+                }
+            }
         }
 
         // === 存活管理（由回放时钟计数，暂停时不计寿命） ===

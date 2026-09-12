@@ -189,6 +189,36 @@ public final class TrajectoryStore
         sets.clear();
     }
 
+    /**
+     * 某影片的全部轨迹
+     *
+     * 烘焙入口用它而不是精确 worldKey：UI 这一层只知道 filmId
+     * （来自 editor.getFilm().getId()），不知道回放 ID、片段起始 tick 和区域标签。
+     * 把 worldKey 的拼装细节留在服务端采集侧，UI 就不必复制那套派生逻辑
+     * —— 复制逻辑正是"两处不一致"类 bug 的温床。
+     */
+    public static List<Set> forFilm(String filmId)
+    {
+        List<Set> result = new ArrayList<>();
+
+        if (filmId == null)
+        {
+            return result;
+        }
+
+        String prefix = filmId + "@";
+
+        for (Set set : sets.values())
+        {
+            if (set.worldKey.startsWith(prefix))
+            {
+                result.add(set);
+            }
+        }
+
+        return result;
+    }
+
     public static int size()
     {
         return sets.size();

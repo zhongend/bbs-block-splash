@@ -298,6 +298,17 @@ public final class TrajectoryBuffer
         return this.bodySamples[body];
     }
 
+    /**
+     * 该刚体第一个样本在 {@link #compactByBody()} 返回的 order[] 中的下标
+     *
+     * 烘焙时用它定位"这个方块的样本区间"：
+     * [firstSampleOf(b), firstSampleOf(b) + samplesOf(b))。
+     */
+    public int firstSampleOf(int body)
+    {
+        return this.bodyFirst[body];
+    }
+
     public int tickAt(int i) { return this.sampleTick[i]; }
     public byte flagsAt(int i) { return this.sampleFlags[i]; }
     public double posX(int i) { return this.posX[i]; }
