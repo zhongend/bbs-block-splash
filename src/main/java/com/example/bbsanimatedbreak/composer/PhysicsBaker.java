@@ -342,6 +342,7 @@ public final class PhysicsBaker
                 out.blockState = track.blockState;
                 out.sourceLabel = "Physics Bake " + String.format("%03d", bakeIndex);
                 out.backendLabel = set.backend;
+                out.timeOffset = set.clipStartTick;
 
                 int n = result.indices.length;
 

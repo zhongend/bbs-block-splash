@@ -15,6 +15,7 @@ import mchorse.bbs_mod.ui.film.clips.UIClip;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.EntityRendererRegistry;
+import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderEvents;
 import net.fabricmc.fabric.api.event.player.AttackBlockCallback;
 import net.minecraft.class_1269;
 import net.minecraft.class_1657;
@@ -41,6 +42,12 @@ public class BlockSplashClient implements ClientModInitializer
     {
         // 注册物理方块实体的渲染器（Sable 风格旋转渲染）
         EntityRendererRegistry.register(PhysicsBlockEntityTypes.PHYSICS_BLOCK, PhysicsBlockEntityRenderer::new);
+
+        // === 3.0 Physics Bake：独立动画文档的回放渲染（规范 §47） ===
+        // START 重置本帧捕获标志；AFTER_ENTITIES 求值并渲染文档轨道。
+        // 捕获本身由 BaseFilmControllerMixin 在 startRenderFrame HEAD 完成。
+        WorldRenderEvents.START.register((context) -> DocumentPlaybackRenderer.onFrameReset());
+        WorldRenderEvents.AFTER_ENTITIES.register(DocumentPlaybackRenderer::renderAfterEntities);
 
         // 注册编辑面板
         UIClip.register(BlockSplashActionClip.class, UIBlockSplashActionClip::new);

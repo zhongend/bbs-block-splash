@@ -12,7 +12,8 @@
         "UIReplaysListPanelAccessor",
         "UIReplaysListPanelMixin",
         "UIClipRenderersMixin",
-        "UIClipMixin"
+        "UIClipMixin",
+        "BaseFilmControllerMixin"
     ],
     "injectors": {
         "defaultRequire": 1

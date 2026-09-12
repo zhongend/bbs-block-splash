@@ -47,7 +47,7 @@ import java.util.List;
  */
 public final class BlockSplashAnimationDocument
 {
-    public static final int SCHEMA_VERSION = 1;
+    public static final int SCHEMA_VERSION = 2;
 
     /* === 图层类型（规范 §五十二）=== */
     public static final int LAYER_BASE = 0;
@@ -125,6 +125,14 @@ public final class BlockSplashAnimationDocument
         /* --- 元数据（规范 §六十七：来源/后端/tick 区间/键数，只在本编辑器显示）--- */
         public String sourceLabel;
         public String backendLabel;
+
+        /**
+         * 轨道时间轴到影片时间轴的偏移（tick）
+         *
+         * 烘焙写入的是物理世界的局部 tick（0 = 片段起始），播放要挂到 BBS 回放时钟
+         * （编辑器游标 / 播放头是影片绝对时间），所以求值时必须加回片段起始 tick。
+         */
+        public int timeOffset;
 
         public int keyCount()
         {
@@ -283,6 +291,11 @@ public final class BlockSplashAnimationDocument
 
             writeByteArray(out, stateBytes);
 
+            if (this.schemaVersion >= 2)
+            {
+                out.writeInt(track.timeOffset);
+            }
+
             writeFloatArray(out, track.posTick);
             writeDoubleArray(out, track.posX);
             writeDoubleArray(out, track.posY);
@@ -345,6 +358,11 @@ public final class BlockSplashAnimationDocument
                     if (state != null) track.blockState = state;
                 }
                 catch (Throwable t) { /* 旧档/跨版本：状态缺失就用默认态 */ }
+            }
+
+            if (doc.schemaVersion >= 2)
+            {
+                track.timeOffset = in.readInt();
             }
 
             track.posTick = readFloatArray(in);
