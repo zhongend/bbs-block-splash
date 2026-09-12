@@ -27,3 +27,7 @@ buildscript/*.log
 /*.jar
 !/releases/
 buildscript/*.class
+
+# AI 助手工作区数据（非项目内容）
+.workbuddy/
+overview.md

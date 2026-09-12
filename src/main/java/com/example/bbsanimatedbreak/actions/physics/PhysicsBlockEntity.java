@@ -15,24 +15,74 @@ import net.minecraft.class_2680;
 import net.minecraft.class_2940;
 
 /**
- * 物理方块实体（Rapier3d 原生物理驱动）
+ * 物理方块实体（刚体物理驱动：Rapier / Jolt）
  *
- * 继承 FallingBlockEntity 以复用渲染器，但 tick() 完全从 native Rapier
- * 刚体读取变换（位置 + 四元数旋转），不做任何 Java 端物理计算。
+ * 继承 FallingBlockEntity 以复用渲染器，但 tick() 完全从刚体读取变换
+ * （位置 + 四元数旋转），不做任何 Java 端物理计算。
  *
- * 物理步进由 PhysicsWorldRegistry.tickAll() 集中处理（每 tick 一次），
- * 本实体只负责读取变换 → 同步到 Minecraft 实体 → 记录。
+ * 物理步进由 {@link PhysicsWorldRegistry} 按 <b>BBS 回放时钟</b> 驱动
+ * （见 BlockSplashActionClip#applyRange），本实体只负责
+ * 读取变换 → 同步到 Minecraft 实体 → 记录。
  *
- * === BlockState 同步策略（关键，避免渲染空气的 bug） ===
- * FallingBlockEntity 的 block 字段是 private，且 initDataTracker() 读 block.isAir()。
- * 如果 block 为 null（公开构造函数不设置），会 NPE 导致构造失败。
- * 修复：在 initDataTracker() 覆写中，调用 super 之前先用 Accessor 设置 block=AIR。
+ * ==================================================================
+ * 第一性原理：客户端为什么不能再做「物理预测」
+ * ==================================================================
+ * 旧实现让客户端每帧用「同步来的速度 + 重力」开环积分预测位置，
+ * 每 tick 再用服务端位置做 20% 校正。这在数学上是一个正反馈回路：
  *
- * === 单位约定 ===
- * - native 位置：方块几何中心（米）
- * - Entity.setPosition(x, y, z)：y 是脚部位置（feet），feet = center - 0.5
- * - native 速度：m/s（与重力 -11.0 m/s² 配套，参考 Sable）
+ *     误差 e  →  积分放大  →  校正不足(只收敛20%)  →  误差更大
+ *
+ * 而且在「预测值」和「lerp 值」之间每帧切换渲染源，两者数值不同，
+ * 于是方块看起来「不跟随物理运动、原地随意抽搐」。
+ *
+ * 更根本的问题是：客户端根本没有权威信息。
+ *   - 服务端 20 TPS 给出权威样本（每 50ms 一个）
+ *   - 渲染 60~165 Hz 需要在样本之间取值
+ *   - 网络会丢包/合并/乱序（本机代理下延迟≈0，但结构性风险在）
+ * 所以客户端唯一正确的做法是 <b>插值</b>：把「两个已确认的权威样本」
+ * 之间用一条曲线连起来，而不是自己往前「猜」。
+ *
+ * 插值曲线的选择也由物理决定：自由落体是二次曲线，
+ * 线性 lerp 会看出折线（"20 帧感"）。因此这里取
+ * <b>最近 3 个权威 tick 样本做二次拉格朗日插值</b>——
+ * 对恒定加速度运动它是精确解，且不需要额外同步速度：
+ *
+ *     样本位于 t = -1, 0, +1（单位 tick），取值为 a, b, c
+ *     τ = tickDelta ∈ [0,1]，渲染 t ∈ [0,1] 之间
+ *
+ *     p(τ) = a·τ(τ-1)/2 + b·(1-τ²) + c·τ(τ+1)/2
+ *
+ * 性质：
+ *   - τ=0 → b，τ=1 → c（与 MC 的 lerp 约定一致：显示"上一 tick + τ"）
+ *   - 恒定加速度下与真实抛物线完全重合（误差 0，而不是线性插值的 O(T²)）
+ *   - 纯函数、无内部累积状态 → 不漂移、不抖动、逐帧可复现
+ *   - 任意帧率、任意时刻拖动时间轴都得到同一结果（BBS 导出必需）
+ *
+ * 旋转同理：取最近两个权威四元数做 slerp（含符号修正）。
+ *
+ * ==================================================================
+ * BlockState 同步策略
+ * ==================================================================
+ * FallingBlockEntity 的 block 字段是 private，且 initDataTracker() 读 block
+ * 造成 NPE。修复：在 initDataTracker() 覆写中，调用 super 之前先用
+ * Accessor 设置 block=AIR。
+ *
+ * ==================================================================
+ * 单位约定
+ * ==================================================================
+ * - 刚体位置：方块几何中心（米）
+ * - Entity.setPosition(x, y, z)：y 是脚部（feet），feet = center - 0.5
+ * - 刚体速度：m/s（与重力 -11.0 m/s² 配套）
  * - Entity.setVelocity：blocks/tick，需 / 20.0 转换
+ *
+ * ==================================================================
+ * native 安全（避免 use-after-free）
+ * ==================================================================
+ * 物理世界可能在实体仍存活时被销毁（空世界/超时/回放停止）。一旦
+ * PhysicsBackendWorld.isValid() 为 false，其 worldPtr 已被释放，
+ * 任何 native 调用都是 use-after-free —— 表现为方块瞬移到垃圾坐标、
+ * 疯狂抽搐甚至游戏崩溃。因此本类在所有 native 调用点前都先检查
+ * isValid()，一旦失效立即自毁。
  */
 public class PhysicsBlockEntity extends class_1540
 {
@@ -42,13 +92,16 @@ public class PhysicsBlockEntity extends class_1540
     private static final class_2940<Float> ROT_Z = FallingBlockRotationData.PHYSICS_ROT_Z;
     private static final class_2940<Float> ROT_W = FallingBlockRotationData.PHYSICS_ROT_W;
 
-    /** 最大存活 tick（60 秒） */
+    /** 最大存活 tick（60 秒，作为兜底超时；正常由回放停止/空世界清理） */
     private static final int MAX_LIFE = 1200;
 
     /* === 物理刚体句柄与所属世界（Rapier / Jolt 双后端统一走 PhysicsBackendWorld） === */
     private long bodyHandle = 0;
     private PhysicsBackendWorld physicsWorld = null;
     private UUID worldId = null;
+
+    /** 所属回放世界的注册键（由 PhysicsWorldRegistry 分配，回退重放时保持稳定） */
+    private String worldKey = null;
 
     /* === 本地保存的 BlockState（服务端构造时设置，客户端从 spawn 包同步） === */
     private class_2680 physicsBlockState = null;
@@ -58,57 +111,33 @@ public class PhysicsBlockEntity extends class_1540
     private UUID replayId = null;
     private int physicsTick = 0;
 
-    /* === 客户端插值用 === */
-    private Quaternionf prevRenderRotation = new Quaternionf(0, 0, 0, 1);
-    private Quaternionf renderRotation = new Quaternionf(0, 0, 0, 1);
-
-    // === 客户端自主位置插值 ===
-    // Minecraft 的 prevX/Y/Z 机制在 PhysicsBlockEntity 中不生效（不调用 super.tick()），
-    // 位置包在 tick 之前更新 entity.x，导致 prevX = x 时两者相同，lerp 插值无效。
-    // 这里维护独立的客户端插值位置，在渲染器中使用。
-    private double prevClientX, prevClientY, prevClientZ;
-    private double clientX, clientY, clientZ;
-    private boolean clientPosInitialized = false;
-
-    // === GC 优化：复用数组，避免每 tick 创建临时数组 ===
-    // 之前每 tick 创建 new double[3] + new float[4] + new float[3] = 3 个数组
-    // 500 个方块 = 1500 个数组/tick = 30000 个数组/秒 → GC 风暴
-    // 改为实例字段复用，零分配
+    /* === GC 优化：复用数组，避免每 tick 创建临时数组 === */
     private final double[] _tmpPos = new double[3];
     private final float[] _tmpRot = new float[4];
     private final double[] _tmpVel = new double[3];
     private final float[] _tmpAngVel = new float[3];
 
     // === 落地稳定检测 ===
-    // 当方块速度很小且在地面附近时，标记为已稳定，停止物理同步以避免震荡闪烁
+    // 方块静止后刚体求解器仍会有亚毫米级微抖，如果继续每 tick 同步，
+    // 客户端会把这点微抖当真实位移插值出来 → 方块在静止时"抽搐"。
+    // 连续 10 tick 低速即判定为已稳定，停止同步（保留最后位置）。
     private boolean settled = false;
     private int lowSpeedTicks = 0;
 
-    // === 客户端物理预测（高刷新率渲染核心） ===
-    // 问题：客户端 tick=20Hz，渲染=165Hz，lerp 在两个 tick 锚点间线性插值，
-    //       但物理下落是二次曲线（重力加速），lerp 直线导致运动不自然 + 看起来像 20fps。
-    // 方案：每帧用当前速度+重力积分预测位置，渲染预测位置而非 lerp。
-    //       位置包到达时做轻微校正（lerp 10%）避免预测发散。
-    private double predX, predY, predZ;           // 预测位置（方块中心，米）
-    private double predVx, predVy, predVz;        // 预测速度（m/s）
-    private float predRotX, predRotY, predRotZ, predRotW;  // 预测旋转四元数
-    private float predAngVx, predAngVy, predAngVz;         // 预测角速度（rad/s）
-    private boolean predInitialized = false;
-    private float clientGravity = -11.0f;          // 客户端重力（m/s²，从服务端同步或默认）
-    private float clientLinearDamping = 0.04f;     // 客户端线性阻尼
-    private float clientAngularDamping = 0.3f;     // 客户端角阻尼
-    // lastTickDelta 存储在每个实体实例上（非渲染器单例），确保多方块场景下
-    // 每个方块都能独立计算帧间增量并更新预测，避免慢动作 bug
-    private float lastTickDelta = 0f;              // 上一帧的 tickDelta（每实体独立）
+    /* ================================================================
+     * 客户端插值状态（纯样本缓存，不做任何积分/预测）
+     * ================================================================ */
 
-    // === BBS 导出 i=0 帧检测 ===
-    // BBS 导出时 RenderTickCounterMixin 每帧累加 tickDelta，整数部分 i = 应推进的 tick 数。
-    // 当 i=0 时 tick 未推进（updateClientData 未调用），predVx/Vy/Vz 是陈旧的。
-    // 如果继续累积积分，位置会发散（飞出去）。
-    // 解决：updateClientData 调用时设置 tickAdvanced=true，updatePredictionFromTickDelta 检测
-    // 该标志，未推进时跳过积分并走 lerp fallback（不发散）。
-    private boolean tickAdvanced = false;          // 本帧是否有 tick 推进（由 updateClientData 设置）
-    private boolean predictionSkippedThisFrame = false;  // i=0 帧跳过了预测积分
+    /** 最近 3 个权威 tick 的方块中心坐标（[0]=最旧 t=-1，[2]=最新 t=+1） */
+    private final double[] sampleCenterX = new double[3];
+    private final double[] sampleCenterY = new double[3];
+    private final double[] sampleCenterZ = new double[3];
+    private int sampleCount = 0;
+
+    /** 最近 2 个权威 tick 的旋转四元数 */
+    private final Quaternionf prevQuat = new Quaternionf(0, 0, 0, 1);
+    private final Quaternionf currQuat = new Quaternionf(0, 0, 0, 1);
+    private boolean quatInitialized = false;
 
     /**
      * 工厂构造函数（由 EntityType 调用，客户端 spawn 包走这里）
@@ -136,9 +165,7 @@ public class PhysicsBlockEntity extends class_1540
         this.field_6014 = x;
         this.field_6036 = y;
         this.field_5969 = z;
-        // 保存 BlockState 到本地字段（getBlockState() 优先返回它）
         this.physicsBlockState = state;
-        // 同时设置 FallingBlockEntity 的 private block 字段（供 createSpawnPacket 序列化）
         try
         {
             ((FallingBlockEntityAccessor) this).bbs$setBlock(state);
@@ -149,16 +176,13 @@ public class PhysicsBlockEntity extends class_1540
     /**
      * 覆写 initDataTracker：在调用 super 之前设置 block=AIR，避免 NPE
      *
-     * 旋转四元数字段（ROT_X/Y/Z/W）已在 FallingBlockEntityDataMixin 中注册，
-     * 不需要在这里再 startTracking。
-     *
-     * 关键修复：初始化 ROT_W = 1.0（单位四元数），避免客户端收到 spawn 包时
+     * 旋转四元数字段已在 FallingBlockEntityDataMixin 中注册。
+     * 初始化 ROT_W = 1.0（单位四元数），避免客户端收到 spawn 包时
      * 四元数为 (0,0,0,0) 无效值导致渲染闪烁。
      */
     @Override
     protected void method_5693()
     {
-        // 用 Accessor 设置 block=AIR，避免 super.initDataTracker() 的 NPE
         try
         {
             ((FallingBlockEntityAccessor) this).bbs$setBlock(class_2246.field_10124.method_9564());
@@ -171,7 +195,6 @@ public class PhysicsBlockEntity extends class_1540
         }
         catch (Throwable t) { /* 忽略，继续 */ }
 
-        // 初始化旋转四元数为单位四元数 (0, 0, 0, 1)，防止客户端渲染闪烁
         try
         {
             this.field_6011.method_12778(ROT_W, 1.0f);
@@ -192,14 +215,12 @@ public class PhysicsBlockEntity extends class_1540
         return super.method_6962();
     }
 
+    /* ================================================================
+     * 刚体绑定
+     * ================================================================ */
+
     /**
-     * 注入刚体句柄和物理世界引用
-     *
-     * 由 BlockSplashActionClip 在创建刚体后调用。
-     *
-     * @param handle  刚体句柄（Rapier 原生句柄 / Jolt body id+1，见 PhysicsBackendWorld）
-     * @param world   所属物理世界（Rapier / Jolt 双后端）
-     * @param worldId 世界注册 ID
+     * 注入刚体句柄和物理世界引用（由 BlockSplashActionClip 创建刚体后调用）
      */
     public void setBodyHandle(long handle, PhysicsBackendWorld world, UUID worldId)
     {
@@ -208,48 +229,58 @@ public class PhysicsBlockEntity extends class_1540
         this.worldId = worldId;
     }
 
+    /** 设置所属回放世界注册键（用于回退重放后的句柄重绑定） */
+    public void setWorldKey(String key) { this.worldKey = key; }
+    public String getWorldKey() { return this.worldKey; }
+
     /**
-     * 覆写 tick()：从 native 读取变换，同步到实体
-     *
-     * 物理步进已由 PhysicsWorldRegistry.tickAll() 集中完成，
-     * 此处只读取结果。
-     *
-     * 动态地面检测：当方块下落且下方有 Minecraft 实心方块但 Rapier 中没有对应
-     * 静态碰撞体时，补加碰撞体，防止方块穿透地面遁地。
+     * 世界被销毁时的回调：断开 native 引用，避免任何后续 native 调用
      */
+    public void detachPhysicsWorld()
+    {
+        this.bodyHandle = 0;
+        this.physicsWorld = null;
+        this.worldId = null;
+    }
+
+    /* ================================================================
+     * tick
+     * ================================================================ */
+
     @Override
     public void method_5773()
     {
-        // 服务端：更新 prevX/Y/Z（用于位置包同步）
-        // 客户端：不设 prevX/Y/Z，由自主插值机制处理（见 updateClientData）
-        if (!this.method_37908().field_9236)
-        {
-            this.field_6014 = this.method_23317();
-            this.field_6036 = this.method_23318();
-            this.field_5969 = this.method_23321();
-        }
-
         if (this.method_37908().field_9236)
         {
-            this.updateClientData();
+            // 客户端：只做样本采集（下面 getRender* 是纯函数）
+            this.updateClientSamples();
             return;
         }
 
-        // 未注入 native 句柄时直接返回（不应发生，防御性检查）
+        // 服务端：维护 prevX/Y/Z（位置包以 tick 为粒度）
+        this.field_6014 = this.method_23317();
+        this.field_6036 = this.method_23318();
+        this.field_5969 = this.method_23321();
+
         if (this.bodyHandle == 0 || this.physicsWorld == null)
         {
             return;
         }
 
-        // === 从 native 读取变换（复用数组，零 GC 分配） ===
-        this.physicsWorld.getBodyTransform(this.bodyHandle, _tmpPos, _tmpRot);
+        // === native 安全闸门 ===
+        // 世界已被销毁（空世界 / 超时 / 回放停止）时 worldPtr 已释放，
+        // 继续调用就是 use-after-free。立即自毁，绝不再触碰 native。
+        if (!this.physicsWorld.isValid())
+        {
+            this.method_31472();
+            return;
+        }
 
-        // === 读取速度 ===
+        // === 从刚体读取变换（复用数组，零 GC 分配） ===
+        this.physicsWorld.getBodyTransform(this.bodyHandle, _tmpPos, _tmpRot);
         this.physicsWorld.getBodyVelocity(this.bodyHandle, _tmpVel);
 
         // === 落地稳定检测 ===
-        // 当方块速度很小且持续多 tick 时，标记为已稳定，
-        // 跳过物理同步避免 Rapier 微小震荡导致的闪烁
         double speedSq = _tmpVel[0] * _tmpVel[0] + _tmpVel[1] * _tmpVel[1] + _tmpVel[2] * _tmpVel[2];
         if (speedSq < 0.04) // 速度 < 0.2 m/s
         {
@@ -265,26 +296,23 @@ public class PhysicsBlockEntity extends class_1540
             this.settled = false;
         }
 
-        // === 动态地面检测（防遁地） ===
-        if (_tmpVel[1] < -0.5)
+        // 已稳定的方块不再同步（求解器微抖不传播到客户端）
+        if (!this.settled)
         {
-            this.checkAndInjectGroundCollision(_tmpPos);
+            // 同步到实体（center → feet，减 0.5）
+            this.method_5814(_tmpPos[0], _tmpPos[1] - 0.5, _tmpPos[2]);
+
+            // 同步旋转四元数到 DataTracker
+            this.field_6011.method_12778(ROT_X, _tmpRot[0]);
+            this.field_6011.method_12778(ROT_Y, _tmpRot[1]);
+            this.field_6011.method_12778(ROT_Z, _tmpRot[2]);
+            this.field_6011.method_12778(ROT_W, _tmpRot[3]);
+
+            // m/s → blocks/tick
+            this.method_18800(_tmpVel[0] / 20.0, _tmpVel[1] / 20.0, _tmpVel[2] / 20.0);
         }
 
-        // 同步到实体（center → feet，减 0.5）
-        this.method_5814(_tmpPos[0], _tmpPos[1] - 0.5, _tmpPos[2]);
-
-        // 同步旋转四元数到 DataTracker
-        this.field_6011.method_12778(ROT_X, _tmpRot[0]);
-        this.field_6011.method_12778(ROT_Y, _tmpRot[1]);
-        this.field_6011.method_12778(ROT_Z, _tmpRot[2]);
-        this.field_6011.method_12778(ROT_W, _tmpRot[3]);
-
-        // m/s → blocks/tick
-        this.method_18800(_tmpVel[0] / 20.0, _tmpVel[1] / 20.0, _tmpVel[2] / 20.0);
-
-        // === 记录物理状态（供后续动画回放转换） ===
-        // 角速度和休眠状态只在 recording 时才需要读取（减少 JNI 调用）
+        // === 记录物理状态（供后续动画回放 / 物理烘焙使用） ===
         if (this.replayId != null)
         {
             this.physicsWorld.getBodyAngularVelocity(this.bodyHandle, _tmpAngVel);
@@ -296,7 +324,7 @@ public class PhysicsBlockEntity extends class_1540
                 _tmpRot[0], _tmpRot[1], _tmpRot[2], _tmpRot[3],
                 _tmpAngVel[0], _tmpAngVel[1], _tmpAngVel[2],
                 this.method_6962(),
-                this.physicsWorld.isBodySleeping(this.bodyHandle)
+                this.settled
             ));
         }
 
@@ -310,361 +338,172 @@ public class PhysicsBlockEntity extends class_1540
         }
     }
 
+    /* ================================================================
+     * 客户端样本采集 + 插值渲染（无预测、无累积状态）
+     * ================================================================ */
+
     /**
-     * 动态地面碰撞检测：检测方块下方 2 格内是否有 MC 实心方块，
-     * 如果有则补加 Rapier 静态碰撞体，防止方块穿透地面遁地。
+     * 客户端每 tick 采集一个权威样本
      *
-     * 仅在方块下落时调用，且每 5 tick 才检测一次以减少性能开销。
+     * 由 tick() 调用（20Hz）。采集的是服务端通过位置包 / DataTracker
+     * 同步过来的权威状态，不做任何推算。
      */
-    private void checkAndInjectGroundCollision(double[] pos)
+    private void updateClientSamples()
     {
-        // 每 5 tick 检测一次，减少性能开销
-        if (this.physicsTick % 5 != 0) return;
+        // 位置样本用方块中心（center = feet + 0.5），向后挪一格
+        this.sampleCenterX[0] = this.sampleCenterX[1];
+        this.sampleCenterY[0] = this.sampleCenterY[1];
+        this.sampleCenterZ[0] = this.sampleCenterZ[1];
+        this.sampleCenterX[1] = this.sampleCenterX[2];
+        this.sampleCenterY[1] = this.sampleCenterY[2];
+        this.sampleCenterZ[1] = this.sampleCenterZ[2];
+        this.sampleCenterX[2] = this.method_23317();
+        this.sampleCenterY[2] = this.method_23318() + 0.5;
+        this.sampleCenterZ[2] = this.method_23321();
 
-        class_1937 world = this.method_37908();
-        if (world == null) return;
-
-        // 检测方块下方 2 格
-        int cx = (int) Math.floor(pos[0]);
-        int cz = (int) Math.floor(pos[2]);
-
-        for (int dy = 0; dy <= 2; dy++)
+        if (this.sampleCount < 3)
         {
-            int cy = (int) Math.floor(pos[1]) - dy;
-            class_2338 blockPos = new class_2338(cx, cy, cz);
-            class_2680 state = world.method_8320(blockPos);
-
-            if (!state.method_26215() && state.method_26204().method_36555() >= 0)
+            // 样本不足时用最新值补齐，避免插值出现 0 坐标
+            if (this.sampleCount == 0)
             {
-                // 下方有实心方块，补加 Rapier 静态碰撞体
-                this.physicsWorld.addStaticBlock(blockPos.method_10263(), blockPos.method_10264(), blockPos.method_10260());
+                this.sampleCenterX[0] = this.sampleCenterX[1] = this.sampleCenterX[2];
+                this.sampleCenterY[0] = this.sampleCenterY[1] = this.sampleCenterY[2];
+                this.sampleCenterZ[0] = this.sampleCenterZ[1] = this.sampleCenterZ[2];
             }
-        }
-    }
-
-    /**
-     * 客户端每 tick 更新插值数据（位置 + 旋转）
-     *
-     * 关键修复：
-     * 1. 位置插值：维护独立的 prevClientX/clientX，避免 prevX==x 导致 lerp 无效
-     * 2. slerp 符号修正：四元数 q 和 -q 表示同一旋转，但 slerp 走不同路径。
-     *    当新四元数与旧四元数点积为负时，翻转新四元数符号，确保 slerp 走最短路径。
-     *    这解决了 Rapier 输出四元数偶尔符号翻转导致的旋转闪烁。
-     * 3. 客户端物理预测：从 DataTracker 同步到预测状态，每帧用速度+重力积分。
-     */
-    private void updateClientData()
-    {
-        // === 位置插值（保留作为 fallback） ===
-        if (!this.clientPosInitialized)
-        {
-            this.prevClientX = this.method_23317();
-            this.prevClientY = this.method_23318();
-            this.prevClientZ = this.method_23321();
-            this.clientX = this.method_23317();
-            this.clientY = this.method_23318();
-            this.clientZ = this.method_23321();
-            this.clientPosInitialized = true;
-        }
-        else
-        {
-            this.prevClientX = this.clientX;
-            this.prevClientY = this.clientY;
-            this.prevClientZ = this.clientZ;
-            this.clientX = this.method_23317();
-            this.clientY = this.method_23318();
-            this.clientZ = this.method_23321();
+            else if (this.sampleCount == 1)
+            {
+                this.sampleCenterX[0] = this.sampleCenterX[1];
+                this.sampleCenterY[0] = this.sampleCenterY[1];
+                this.sampleCenterZ[0] = this.sampleCenterZ[1];
+            }
+            this.sampleCount++;
         }
 
-        // === 旋转插值（含 slerp 符号修正） ===
-        this.prevRenderRotation.set(this.renderRotation);
-
+        // 旋转样本（含 slerp 符号修正：q 与 -q 表示同一旋转，
+        // 若点积为负需翻转符号，否则 slerp 会走远路导致旋转抽帧）
         float qx = this.field_6011.method_12789(ROT_X);
         float qy = this.field_6011.method_12789(ROT_Y);
         float qz = this.field_6011.method_12789(ROT_Z);
         float qw = this.field_6011.method_12789(ROT_W);
 
-        // slerp 符号修正：如果新旧四元数点积 < 0，翻转新四元数符号
-        float dot = this.prevRenderRotation.x * qx
-                  + this.prevRenderRotation.y * qy
-                  + this.prevRenderRotation.z * qz
-                  + this.prevRenderRotation.w * qw;
+        float mag = qx * qx + qy * qy + qz * qz + qw * qw;
+        if (mag < 1e-8f)
+        {
+            // 无效四元数：保持上一帧，避免渲染闪烁
+            qx = 0; qy = 0; qz = 0; qw = 1;
+        }
+
+        if (!this.quatInitialized)
+        {
+            this.prevQuat.set(qx, qy, qz, qw);
+            this.currQuat.set(qx, qy, qz, qw);
+            this.quatInitialized = true;
+            return;
+        }
+
+        this.prevQuat.set(this.currQuat);
+
+        float dot = this.prevQuat.x * qx + this.prevQuat.y * qy
+                  + this.prevQuat.z * qz + this.prevQuat.w * qw;
         if (dot < 0.0f)
         {
-            qx = -qx;
-            qy = -qy;
-            qz = -qz;
-            qw = -qw;
+            qx = -qx; qy = -qy; qz = -qz; qw = -qw;
         }
 
-        this.renderRotation.set(qx, qy, qz, qw);
-
-        // === 客户端物理预测同步 ===
-        // 每 tick（20Hz）从 DataTracker 同步锚点位置和旋转到预测状态
-        // 渲染时每帧（165Hz）调用 updatePrediction(dt) 用速度+重力积分预测中间帧
-        if (!this.predInitialized)
-        {
-            // 首次初始化：预测位置 = entity 位置（feet → center 加 0.5）
-            this.predX = this.method_23317();
-            this.predY = this.method_23318() + 0.5;
-            this.predZ = this.method_23321();
-            this.predVx = 0;
-            this.predVy = 0;
-            this.predVz = 0;
-            this.predRotX = qx;
-            this.predRotY = qy;
-            this.predRotZ = qz;
-            this.predRotW = qw;
-            this.predAngVx = 0;
-            this.predAngVy = 0;
-            this.predAngVz = 0;
-            this.predInitialized = true;
-        }
-        else
-        {
-            // 后续同步：用服务端位置校正预测位置（lerp 20% 避免发散但保留预测平滑性）
-            double targetX = this.method_23317();
-            double targetY = this.method_23318() + 0.5;
-            double targetZ = this.method_23321();
-            this.predX += (targetX - this.predX) * 0.2;
-            this.predY += (targetY - this.predY) * 0.2;
-            this.predZ += (targetZ - this.predZ) * 0.2;
-
-            // 从位置差反推速度（20Hz，dt=0.05s）
-            double dt = 0.05;
-            this.predVx = (targetX - this.prevClientX) / dt;
-            this.predVy = (targetY - (this.prevClientY + 0.5)) / dt;
-            this.predVz = (targetZ - this.prevClientZ) / dt;
-
-            // 旋转同步：直接采用服务端四元数
-            this.predRotX = qx;
-            this.predRotY = qy;
-            this.predRotZ = qz;
-            this.predRotW = qw;
-        }
-
-        // 标记本 tick 已推进（供 updatePredictionFromTickDelta 检测 i=0 帧）
-        this.tickAdvanced = true;
+        this.currQuat.set(qx, qy, qz, qw);
     }
 
     /**
-     * 从 tickDelta 计算帧间增量并推进预测（每实体独立 lastTickDelta）
+     * 二次拉格朗日插值（节点位于 -1, 0, +1）
      *
-     * 由渲染器每帧调用，把 Minecraft 提供的 tickDelta（0~1，当前 tick 已经过去的比例）
-     * 转换为帧间时间增量（秒），再委托给 updatePrediction(dt)。
-     *
-     * === BBS 导出 i=0 帧检测 ===
-     * BBS 导出时 RenderTickCounterMixin 每帧累加 tickDelta，整数部分 i = 应推进的 tick 数。
-     * 当 i=0 时 tick 未推进（updateClientData 未调用），tickAdvanced=false。
-     * 此时跳过预测积分（predVx/Vy/Vz 是陈旧的，积分会发散），让 getRenderX 走 lerp fallback。
-     * 当 i>=1 时 tick 推进，updateClientData 已调用，tickAdvanced=true，正常预测。
-     *
-     * @param tickDelta Minecraft 提供的当前 tick 进度（0~1）
+     * 对恒定加速度运动（自由落体）是精确解。
+     * τ = 0 → b，τ = 1 → c。
      */
-    public void updatePredictionFromTickDelta(float tickDelta)
+    private static double quadratic(double a, double b, double c, float tau)
     {
-        // === BBS 导出 i=0 帧检测 ===
-        // tickAdvanced 由 updateClientData 设置，每 tick（20Hz）调用一次时设为 true。
-        // 如果本帧 tickAdvanced=false，说明 tick 未推进（i=0 帧），跳过预测积分避免发散。
-        if (this.predInitialized && !this.tickAdvanced)
-        {
-            this.predictionSkippedThisFrame = true;
-            return;
-        }
-        this.predictionSkippedThisFrame = false;
-        this.tickAdvanced = false;  // 消费标志，为下一帧准备
+        double t = tau;
+        double l0 = t * (t - 1.0) * 0.5;   // 节点 -1
+        double l1 = (1.0 - t) * (1.0 + t); // 节点  0
+        double l2 = t * (t + 1.0) * 0.5;   // 节点 +1
+        return a * l0 + b * l1 + c * l2;
+    }
 
-        if (!this.predInitialized)
+    /** 渲染用方块中心 X（米） */
+    public double getRenderCenterX(float tickDelta)
+    {
+        if (this.sampleCount < 2)
         {
-            // 首帧：仅记录 tickDelta，不更新预测（避免大跳变）
-            this.lastTickDelta = tickDelta;
+            return this.method_23317();
+        }
+        return quadratic(this.sampleCenterX[0], this.sampleCenterX[1], this.sampleCenterX[2], tickDelta);
+    }
+
+    /** 渲染用方块中心 Y（米） */
+    public double getRenderCenterY(float tickDelta)
+    {
+        if (this.sampleCount < 2)
+        {
+            return this.method_23318() + 0.5;
+        }
+        return quadratic(this.sampleCenterY[0], this.sampleCenterY[1], this.sampleCenterY[2], tickDelta);
+    }
+
+    /** 渲染用方块中心 Z（米） */
+    public double getRenderCenterZ(float tickDelta)
+    {
+        if (this.sampleCount < 2)
+        {
+            return this.method_23321();
+        }
+        return quadratic(this.sampleCenterZ[0], this.sampleCenterZ[1], this.sampleCenterZ[2], tickDelta);
+    }
+
+    /**
+     * 渲染用旋转四元数（两样本 slerp，调用方负责 copy）
+     */
+    public void getRenderRotation(float tickDelta, Quaternionf out)
+    {
+        if (!this.quatInitialized)
+        {
+            // 退回到 DataTracker 当前值
+            float qx = this.field_6011.method_12789(ROT_X);
+            float qy = this.field_6011.method_12789(ROT_Y);
+            float qz = this.field_6011.method_12789(ROT_Z);
+            float qw = this.field_6011.method_12789(ROT_W);
+            if (qx * qx + qy * qy + qz * qz + qw * qw < 1e-8f)
+            {
+                out.identity();
+            }
+            else
+            {
+                out.set(qx, qy, qz, qw).normalize();
+            }
             return;
         }
 
-        // 帧间增量 = 当前 tickDelta - 上一帧 tickDelta
-        // 若为负，表示跨 tick（新 tick 从 0 开始），+1 补偿
-        float delta = tickDelta - this.lastTickDelta;
-        if (delta < 0f)
-        {
-            delta += 1f;
-        }
-        this.lastTickDelta = tickDelta;
-
-        // dt = tickDelta 增量 × 0.05（1 tick = 0.05s）
-        float dt = delta * 0.05f;
-
-        if (dt > 0f)
-        {
-            updatePrediction(dt);
-        }
-    }
-
-    /**
-     * 客户端每帧物理预测（高刷新率渲染核心）
-     *
-     * 由 updatePredictionFromTickDelta 委托调用，用当前速度+重力积分预测位置，
-     * 用角速度积分预测旋转。这样 165Hz 渲染时每帧都有新位置，而非 lerp 两个 20Hz 锚点。
-     *
-     * 物理模型：
-     * - 位置：p += v*dt + 0.5*g*dt²（含重力的二次积分）
-     * - 速度：v = v*(1-damping*dt) + g*dt（阻尼+重力）
-     * - 旋转：q' = q * delta_q(angVel*dt)（角速度积分）
-     *
-     * @param dt 距离上一帧的时间（秒），通常 1/165 ≈ 0.006s
-     */
-    public void updatePrediction(float dt)
-    {
-        if (!this.predInitialized || dt <= 0 || dt > 0.1f) return;
-
-        // === 位置预测：含重力的二次积分 ===
-        double halfDtSq = 0.5 * clientGravity * dt * dt;
-        this.predX += this.predVx * dt;
-        this.predY += this.predVy * dt + halfDtSq;
-        this.predZ += this.predVz * dt;
-
-        // === 速度预测：阻尼 + 重力 ===
-        double linDampFactor = 1.0 - clientLinearDamping * dt;
-        if (linDampFactor < 0) linDampFactor = 0;
-        this.predVx *= linDampFactor;
-        this.predVy = this.predVy * linDampFactor + clientGravity * dt;
-        this.predVz *= linDampFactor;
-
-        // === 旋转预测：角速度积分 ===
-        float halfAngX = predAngVx * dt * 0.5f;
-        float halfAngY = predAngVy * dt * 0.5f;
-        float halfAngZ = predAngVz * dt * 0.5f;
-        float halfAngMag = (float) Math.sqrt(halfAngX * halfAngX + halfAngY * halfAngY + halfAngZ * halfAngZ);
-
-        if (halfAngMag > 1e-6f)
-        {
-            float s = (float) Math.sin(halfAngMag) / halfAngMag;
-            float dqx = halfAngX * s;
-            float dqy = halfAngY * s;
-            float dqz = halfAngZ * s;
-            float dqw = (float) Math.cos(halfAngMag);
-
-            // 归一化增量四元数
-            float invMag = 1.0f / (float) Math.sqrt(dqx * dqx + dqy * dqy + dqz * dqz + dqw * dqw);
-            dqx *= invMag; dqy *= invMag; dqz *= invMag; dqw *= invMag;
-
-            // q' = delta_q * q（左乘）
-            float nx = dqw * predRotX + dqx * predRotW + dqy * predRotZ - dqz * predRotY;
-            float ny = dqw * predRotY - dqx * predRotZ + dqy * predRotW + dqz * predRotX;
-            float nz = dqw * predRotZ + dqx * predRotY - dqy * predRotX + dqz * predRotW;
-            float nw = dqw * predRotW - dqx * predRotX - dqy * predRotY - dqz * predRotZ;
-            predRotX = nx; predRotY = ny; predRotZ = nz; predRotW = nw;
-
-            // 角速度阻尼
-            float angDampFactor = 1.0f - clientAngularDamping * dt;
-            if (angDampFactor < 0) angDampFactor = 0;
-            predAngVx *= angDampFactor;
-            predAngVy *= angDampFactor;
-            predAngVz *= angDampFactor;
-        }
-    }
-
-    /**
-     * 设置客户端物理预测参数（由 ActionClip 在创建时调用，同步服务端配置）
-     */
-    public void setClientPhysicsParams(float gravity, float linearDamping, float angularDamping,
-                                       float angVx, float angVy, float angVz)
-    {
-        this.clientGravity = gravity;
-        this.clientLinearDamping = linearDamping;
-        this.clientAngularDamping = angularDamping;
-        this.predAngVx = angVx;
-        this.predAngVy = angVy;
-        this.predAngVz = angVz;
-    }
-
-    /**
-     * 获取渲染插值位置 X（客户端渲染器使用）
-     *
-     * 优先返回客户端物理预测位置（165Hz 平滑），fallback 到 lerp（20Hz）
-     * BBS 导出视频时 tickDelta 可能固定，预测位置同样适用
-     */
-    public double getRenderX(float tickDelta)
-    {
-        if (this.predInitialized && !this.predictionSkippedThisFrame)
-        {
-            return this.predX;
-        }
-        // Fallback：lerp（i=0 帧或 predInitialized=false 时使用）
-        if (tickDelta <= 0.0f) return this.prevClientX;
-        if (tickDelta >= 1.0f) return this.clientX;
-        return this.prevClientX + (this.clientX - this.prevClientX) * tickDelta;
-    }
-
-    /**
-     * 获取渲染插值位置 Y（客户端渲染器使用）
-     */
-    public double getRenderY(float tickDelta)
-    {
-        if (this.predInitialized && !this.predictionSkippedThisFrame)
-        {
-            return this.predY;
-        }
-        if (tickDelta <= 0.0f) return this.prevClientY;
-        if (tickDelta >= 1.0f) return this.clientY;
-        return this.prevClientY + (this.clientY - this.prevClientY) * tickDelta;
-    }
-
-    /**
-     * 获取渲染插值位置 Z（客户端渲染器使用）
-     */
-    public double getRenderZ(float tickDelta)
-    {
-        if (this.predInitialized && !this.predictionSkippedThisFrame)
-        {
-            return this.predZ;
-        }
-        if (tickDelta <= 0.0f) return this.prevClientZ;
-        if (tickDelta >= 1.0f) return this.clientZ;
-        return this.prevClientZ + (this.clientZ - this.prevClientZ) * tickDelta;
-    }
-
-    /**
-     * 获取渲染插值旋转四元数
-     *
-     * 优先返回客户端物理预测旋转（165Hz 角速度积分），fallback 到 slerp
-     */
-    public Quaternionf getRenderRotation(float tickDelta)
-    {
-        Quaternionf result = new Quaternionf();
-        if (this.predInitialized && !this.predictionSkippedThisFrame)
-        {
-            result.set(this.predRotX, this.predRotY, this.predRotZ, this.predRotW);
-            return result;
-        }
-        // Fallback：slerp
         if (tickDelta <= 0.0f)
         {
-            result.set(this.prevRenderRotation);
+            out.set(this.prevQuat);
         }
         else if (tickDelta >= 1.0f)
         {
-            result.set(this.renderRotation);
+            out.set(this.currQuat);
         }
         else
         {
-            this.prevRenderRotation.slerp(this.renderRotation, tickDelta, result);
+            this.prevQuat.slerp(this.currQuat, tickDelta, out);
         }
-        return result;
     }
 
     /* === 物理参数设置 === */
 
     /**
-     * 设置初始线速度
-     *
-     * @param vx blocks/tick（Minecraft 速度单位）
-     * @param vy blocks/tick
-     * @param vz blocks/tick
+     * 设置初始线速度（blocks/tick，Minecraft 速度单位）
      */
     public void setInitialVelocity(double vx, double vy, double vz)
     {
-        if (this.physicsWorld != null && this.bodyHandle != 0)
+        if (this.physicsWorld != null && this.physicsWorld.isValid() && this.bodyHandle != 0)
         {
-            // blocks/tick → m/s
             this.physicsWorld.setBodyVelocity(this.bodyHandle, vx * 20.0, vy * 20.0, vz * 20.0);
         }
         this.method_18800(vx, vy, vz);
@@ -673,14 +512,12 @@ public class PhysicsBlockEntity extends class_1540
     /**
      * 设置随机角速度（rad/s）
      *
-     * @param magnitude 角速度强度（视觉值，会乘以系数转为 rad/s）
+     * 用确定性随机（基于 bodyHandle）保证回放一致。
      */
     public void setRandomAngularVelocity(float magnitude)
     {
-        if (this.physicsWorld != null && this.bodyHandle != 0)
+        if (this.physicsWorld != null && this.physicsWorld.isValid() && this.bodyHandle != 0)
         {
-            // magnitude 是视觉强度，转为 rad/s
-            // 用确定性随机基于 bodyHandle，保证回放一致
             java.util.Random rand = new java.util.Random(this.bodyHandle);
             float scale = magnitude * 2.0F;
             this.physicsWorld.setBodyAngularVelocity(this.bodyHandle,
@@ -691,60 +528,52 @@ public class PhysicsBlockEntity extends class_1540
         }
     }
 
-    /**
-     * 直接设置角速度（rad/s）
-     */
+    /** 直接设置角速度（rad/s） */
     public void setAngularVelocity(float ax, float ay, float az)
     {
-        if (this.physicsWorld != null && this.bodyHandle != 0)
+        if (this.physicsWorld != null && this.physicsWorld.isValid() && this.bodyHandle != 0)
         {
             this.physicsWorld.setBodyAngularVelocity(this.bodyHandle, ax, ay, az);
         }
     }
 
-    /**
-     * 施加冲量（N·s）
-     */
+    /** 施加冲量（N·s） */
     public void applyImpulse(double ix, double iy, double iz)
     {
-        if (this.physicsWorld != null && this.bodyHandle != 0)
+        if (this.physicsWorld != null && this.physicsWorld.isValid() && this.bodyHandle != 0)
         {
             this.physicsWorld.applyImpulse(this.bodyHandle, ix, iy, iz);
         }
     }
 
-    // 以下方法保留为 no-op（Rust 端在创建刚体时已设置 friction/restitution）
-    public void setRestitution(float restitution) { /* 在 createDynamicBlock 时设置 */ }
-    public void setFriction(float friction) { /* 在 createDynamicBlock 时设置 */ }
-    public void setGravityScale(float gravityScale) { /* Rapier 默认重力，暂不支持单独设置 */ }
-
     public void setBlockId(int blockId) { this.blockId = blockId; }
     public void setReplayId(UUID replayId) { this.replayId = replayId; }
     public int getBlockId() { return this.blockId; }
 
-    /**
-     * 判断刚体是否休眠
-     */
+    /** 当前已模拟 tick 数（物理世界用于生命周期管理） */
+    public int getPhysicsTick() { return this.physicsTick; }
+
+    /** 刚体是否休眠 */
     public boolean isSleeping()
     {
-        if (this.physicsWorld != null && this.bodyHandle != 0)
+        if (this.physicsWorld != null && this.physicsWorld.isValid() && this.bodyHandle != 0)
         {
             return this.physicsWorld.isBodySleeping(this.bodyHandle);
         }
         return false;
     }
 
-    /* === 供 PhysicsEntityManager 使用的坐标 getter（返回方块中心，从 native 读取） === */
+    /* === 供 PhysicsEntityManager / PhysicsEngine 使用的坐标 getter（方块中心） === */
 
     /**
-     * @deprecated 已迁移到 native Rapier 物理，此方法返回 null（仅供旧 PhysicsEngine 编译）
+     * @deprecated 已迁移到刚体物理，此方法返回 null
      */
     @Deprecated
     public PhysicsState getPhysicsState() { return null; }
 
     public double getCenterX()
     {
-        if (this.physicsWorld != null && this.bodyHandle != 0)
+        if (this.physicsWorld != null && this.physicsWorld.isValid() && this.bodyHandle != 0)
         {
             this.physicsWorld.getBodyTransform(this.bodyHandle, _tmpPos, _tmpRot);
             return _tmpPos[0];
@@ -754,7 +583,7 @@ public class PhysicsBlockEntity extends class_1540
 
     public double getCenterY()
     {
-        if (this.physicsWorld != null && this.bodyHandle != 0)
+        if (this.physicsWorld != null && this.physicsWorld.isValid() && this.bodyHandle != 0)
         {
             this.physicsWorld.getBodyTransform(this.bodyHandle, _tmpPos, _tmpRot);
             return _tmpPos[1];
@@ -764,7 +593,7 @@ public class PhysicsBlockEntity extends class_1540
 
     public double getCenterZ()
     {
-        if (this.physicsWorld != null && this.bodyHandle != 0)
+        if (this.physicsWorld != null && this.physicsWorld.isValid() && this.bodyHandle != 0)
         {
             this.physicsWorld.getBodyTransform(this.bodyHandle, _tmpPos, _tmpRot);
             return _tmpPos[2];
@@ -773,19 +602,19 @@ public class PhysicsBlockEntity extends class_1540
     }
 
     /**
-     * 覆写 remove：从 native world 移除刚体（释放 native 内存）
+     * 覆写 remove：从物理世界移除刚体（释放 native 内存）
      *
-     * discard() 是 final，但它内部调用 remove()，所以覆写 remove 能覆盖所有移除路径。
-     * 不销毁物理世界（世界由 PhysicsWorldRegistry 超时/clearAll 管理）。
+     * 关键：世界已销毁时绝不能再调 native（use-after-free）。
      */
     @Override
     public void method_5650(class_5529 reason)
     {
-        if (this.physicsWorld != null && this.bodyHandle != 0)
+        if (this.physicsWorld != null && this.physicsWorld.isValid() && this.bodyHandle != 0)
         {
             this.physicsWorld.removeBody(this.bodyHandle);
-            this.bodyHandle = 0;
         }
+        this.bodyHandle = 0;
+        this.physicsWorld = null;
         super.method_5650(reason);
     }
 }

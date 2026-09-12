@@ -11,7 +11,7 @@
 |---|---|
 | 模组 ID | `bbsblocksplash` |
 | 模组名称 | `bbs_Block_Splash` |
-| 当前版本 | 2.1.0 |
+| 当前版本 | 2.2.0 |
 | 作者 | **zhongend** |
 | 许可证 | MIT |
 | 前置 | Minecraft **1.20.1**（精确匹配）、Fabric Loader ≥ 0.15.0、Fabric API、**BBS 模组** |
@@ -29,9 +29,9 @@
 - [4. 与 BBS 模组的对接方式](#4-与-bbs-模组的对接方式)
 - [5. 五大特效详解](#5-五大特效详解)
 - [6. 物理系统深度剖析（三引擎设计）](#6-物理系统深度剖析三引擎设计)
-- [7. 服务端调度器家族](#7-服务端调度器家族)
-- [8. Mixin 注入体系（14 个 Mixin）](#8-mixin-注入体系14-个-mixin)
-- [9. 网络同步与 165Hz 高刷新率渲染](#9-网络同步与-165hz-高刷新率渲染)
+- [7. 服务端调度器家族（含回放时钟）](#7-服务端调度器家族)
+- [8. Mixin 注入体系（15 个 Mixin）](#8-mixin-注入体系14-个-mixin)
+- [9. 网络同步与高刷新率渲染](#9-网络同步与高刷新率渲染)
 - [10. 存档安全设计（三层恢复保险）](#10-存档安全设计三层恢复保险)
 - [11. 性能设计与资源泄漏治理](#11-性能设计与资源泄漏治理)
 - [12. 使用指南](#12-使用指南)
@@ -74,8 +74,20 @@ BBS（原 Blockbuster 模组的后继者）是 Minecraft 电影（machinima）�
 4. **恢复机制必须独立于宿主模组，且要有三层保险。**
    BBS 自带 DamageControl（回放中记录方块变更，回放结束恢复），但它在"回放播到一半游戏直接退出"时无能为力。所以本插件自建 `BlockSplashRecoveryManager`，在 `SERVER_STOPPING` 事件兜底恢复——详见 [第 10 章](#10-存档安全设计三层恢复保险)。
 
-5. **渲染必须突破 Minecraft 20 TPS 的天花板。**
-   服务器 20 tick/秒，但玩家屏幕可能是 144Hz/165Hz。如果不做特殊处理，方块旋转看起来只有 20 帧。本插件为此做了一整套客户端每帧预测/插值体系——详见 [第 9 章](#9-网络同步与-165hz-高刷新率渲染)。
+5. **渲染必须突破 Minecraft 20 TPS 的天花板，但只能靠"插值"而不能靠"预测"。**
+   服务器 20 tick/秒，但屏幕可能是 144Hz/165Hz。直觉上会想"客户端用速度积分往前猜"，
+   但那是**开环预测**：网络会丢包/乱序/延迟，猜出来的位置没有权威校正源，误差会累积成漂移与抖动。
+   正确的做法是把渲染位置定义为「两个已确认权威样本之间的插值函数」——
+   纯函数、无累积状态、与帧率无关，因此实时预览与 BBS 导出逐帧一致。
+   本插件用**二次拉格朗日插值（最近 3 个权威 tick 样本）**，对自由落体这类恒定加速度运动是精确解，
+   旋转用两样本 slerp——详见 [第 9 章](#9-网络同步与高刷新率渲染)。
+
+6. **物理必须由回放时钟驱动，而不是由服务端 tick 驱动。**
+   这是"电影工具"与"游戏玩法"的分水岭：拍摄需要**定格、倒拖、可复现**。
+   旧实现把物理步进挂在 `ServerTickEvents.END_SERVER_TICK` 上，于是
+   暂停回放时方块仍在继续下落、拖动时间轴时物理与画面不对应、导出视频不可复现。
+   正确挂载点是 BBS 的 `ActionClip.applyRange()`——它在"片段覆盖的每个 tick"被调用，
+   且只在回放时钟真正推进时调用——详见 [第 7 章](#7-服务端调度器家族)。
 
 ### 1.3 一句话总结
 
@@ -109,7 +121,7 @@ BBS（原 Blockbuster 模组的后继者）是 Minecraft 电影（machinima）�
 │  │  ├─ NativePhysicsWorld  │            │ BlockSplashReverseScheduler  │  │
 │  │  │  └─ JNI → bbs_physics│            │ BlockPathScheduler           │  │
 │  │  │     (Rapier3d, Rust) │            │ BlockSplashAnimationScheduler│  │
-│  │  └─ JoltPhysicsWorld    │            │ PhysicsWorldRegistry.tickAll │  │
+│  │  └─ JoltPhysicsWorld    │            │ PhysicsWorldRegistry.driveTo │  │
 │  │     └─ jolt-jni (Jolt)  │            └──────────────────┬───────────┘  │
 │  │ PhysicsBlockEntity      │                               │              │
 │  │  └─ 读刚体变换→MC实体     │                               │              │
@@ -126,8 +138,8 @@ BBS（原 Blockbuster 模组的后继者）是 Minecraft 电影（machinima）�
 │                                                                         │
 │  ┌────────────────── 客户端（client/）────────────────────────────────┐   │
 │  │ BlockSplashClient          注册渲染器/UI面板/木棍左键/粒子描边         │   │
-│  │ PhysicsBlockEntityRenderer 165Hz 物理预测渲染                        │   │
-│  │ ClientRotationStateManager 每帧旋转积分状态                          │   │
+│  │ PhysicsBlockEntityRenderer 高刷插值渲染（二次插值+slerp）             │   │
+│  │ ClientRotationStateManager 每帧旋转积分状态（原版路径用）              │   │
 │  │ UI*ActionClip × 4          各特效的 BBS 编辑面板                     │   │
 │  │ UIPathEditorMenu           路径点编辑器                              │   │
 │  │ UIComboEditorOverlay       组合编辑器（子轨道预览）                    │   │
@@ -151,9 +163,10 @@ BlockSplashActionClip.applyAction()
         ├─⑤ calculateVelocityByShape()  按形状(ray/spiral/sphere/arc)算初速度
         ├─⑥ 创建刚体/实体并赋初速度、角速度
         │
-        ▼ 之后每个服务端 tick（END_SERVER_TICK）
-   [Sable模式] PhysicsWorldRegistry.tickAll() → Rapier 步进 →
+        ▼ 之后每个回放 tick（ActionClip.applyRange —— 回放时钟驱动）
+   [Sable/Jolt] PhysicsWorldRegistry.driveTo() → 刚体步进 →
                PhysicsBlockEntity 读刚体变换 → 同步到 MC 实体 → 记录到 Recording
+               暂停回放 → applyRange 不再被调用 → 物理一起定格
    [原版模式]  FallingBlockEntityPhysicsMixin 在 tick 末尾注入
                RotatingFallingBlockManager 的弹跳/摩擦/旋转物理
                BlockSplashAnimationScheduler 在到期时驱动缩小消失
@@ -190,7 +203,8 @@ BlockSplashActionClip.applyAction()
     │   ├── BlockShockwaveScheduler.java     振波调度器（881 行，波浪传播核心）
     │   ├── BlockSplashAddon.java            主入口
     │   ├── BlockSplashAnimationScheduler.java  缩小消失动画调度器（ease-in quadratic）
-    │   ├── BlockSplashRecoveryManager.java  存档恢复管理器（退出保护核心）
+    │   ├── BlockSplashRecoveryManager.java  存档恢复管理器（退出保护核心，位置去重）
+    │   ├── BlockSplashReplayHook.java        回放停止钩子（由 ActionPlayerStopMixin 调用）
     │   ├── BlockSplashReverseScheduler.java 反向飞溅调度器（932 行，四阶段状态机）
     │   ├── FallingBlockRotationData.java    DataTracker 字段注册表（15 个同步字段）
     │   ├── RegionSelectionCache.java        区域选择坐标缓存
@@ -220,7 +234,7 @@ BlockSplashActionClip.applyAction()
     │   │       ├── PhysicsRecording.java       单帧物理记录（不可变）
     │   │       ├── PhysicsRecordingManager.java 按 replayId 分组的记录缓存
     │   │       ├── PhysicsState.java           物理状态数据类
-    │   │       └── PhysicsWorldRegistry.java   物理世界注册表（生命周期管理）
+    │   │       └── PhysicsWorldRegistry.java   物理世界注册表（回放时钟驱动 + 生命周期 + 确定性回退重放）
     │   ├── client/                          客户端专属
     │   │   ├── BlockSplashClient.java       客户端入口
     │   │   ├── ClientRotationStateManager.java  每帧旋转状态
@@ -237,7 +251,7 @@ BlockSplashActionClip.applyAction()
     │   │   └── mixin/                       9 个客户端 Mixin
     │   ├── items/
     │   │   └── RegionSelectorItem.java      区域选择木棍
-    │   └── mixin/                           5 个服务端 Mixin
+    │   └── mixin/                           6 个服务端 Mixin（含 ActionPlayerStopMixin 回放停止钩子）
     └── resources/
         ├── fabric.mod.json                  模组元数据
         ├── bbsblocksplash.mixins.json       服务端 Mixin 配置
@@ -362,7 +376,10 @@ UIClip.register(BlockPathActionClip.class,          UIBlockPathActionClip::new);
 3. **注入静态碰撞体** `injectStaticCollisionBlocks()`：以每个飞溅方块为中心、`collisionRadius` 半径内的非飞溅非空气方块注册为 Rapier 静态刚体（地面/墙壁），上限 2000 个（性能保护）。
 4. **创建动态刚体**：每个抽样方块 `createDynamicBlock(中心坐标, mass=1.0, friction=0.8, restitution=0.1)` → 设置自定义阻尼 → 初速度（形状算法，blocks/tick × 20 = m/s）→ 角速度（`min(速度×6, 12)` rad/s，按方块坐标 hash 加随机方向，让翻转自然）。
 5. **创建 `PhysicsBlockEntity`**：注入刚体句柄、初速度、客户端物理预测参数（重力/阻尼/角速度——客户端 165Hz 预渲染要用），关联 Recording 系统与 Recovery 系统。
-6. 每服务端 tick 由 `PhysicsWorldRegistry.tickAll(1/20)` 以 **2 子步**步进 Rapier，实体读取刚体位置+四元数旋转同步渲染。
+6. 之后每个**回放 tick** 由 `BlockSplashActionClip.applyRange()` 调用
+   `PhysicsWorldRegistry.driveTo(key, localTick)`，以 **2 子步**（Rapier）/ **3 子步**（Jolt）
+   步进刚体世界，实体读取刚体位置 + 四元数旋转同步渲染。
+   **暂停回放 → 不再步进 → 物理定格**（这是与旧版"END_SERVER_TICK 步进"的本质区别）。
 
 #### 四种飞溅形状的速度算法（`calculateVelocityByShape`）
 
@@ -556,17 +573,40 @@ sable=true（默认）                          sable=false
 
 `NativeLibraryLoader` 的加载顺序：先 `System.loadLibrary`（开发环境直连 `target/release`），失败后从 JAR 内 `/natives/{os}/` 提取 `.dll/.so/.dylib` 到临时目录再 `System.load`。当前 JAR 内置 **Windows x64** 的 `bbs_physics.dll`（924 KB）；Rapier 侧为 `rapier3d-f64 0.33.0`，启用 PGS 约束求解器、库仑摩擦锥、多点接触流形、CCD、IslandManager 休眠。
 
-`NativePhysicsWorld` 是 `AutoCloseable` 封装（handle==0 抛异常、finalize 兜底释放）。
+`NativePhysicsWorld` 是 `AutoCloseable` 封装。**所有 native 调用都经过 `valid` 闸门**：
+`close()` 之后 worldPtr 已被释放，此时设置类方法直接忽略、读取类方法写入安全默认值
+（位置 0 / 单位四元数 / 速度 0）——把 use-after-free 的后果从"垃圾坐标 + 抽搐 + 崩溃"降级为"静止的默认值"。
+`JoltPhysicsWorld` 同样对全部读写方法加了 `valid` 前置判断。
 
 ### 6.4 物理世界生命周期（PhysicsWorldRegistry）
 
-Rapier 的 `pipeline.step()` 必须**每个世界每 tick 调用一次**（而非每实体一次），所以所有世界集中在注册表中，由 `END_SERVER_TICK` 统一步进（`dt=1/20`，2 子步）。
+物理世界按 **BBS 回放时钟** 推进：由 `BlockSplashActionClip.applyRange()` 每回放 tick
+调用一次 `PhysicsWorldRegistry.driveTo(key, localTick)`。这与旧版的
+`ServerTickEvents.END_SERVER_TICK → tickAll()` 有本质区别——见 [第 7 章](#7-服务端调度器家族)。
 
-销毁触发条件（三选一，触发即销毁并**连带清理**）：
+**确定性键（幂等）**：`worldKey = filmId + "@" + replayId + "#" + 片段起始tick`。
+BBS 的 `ActionPlayer.goTo()` 在拖动时间轴时会**逐 tick 重放** `applyAction`，
+若非幂等，同一位置会被反复生成刚体 → 数百个方块重叠互挤 → 剧烈随机抽搐。
+用确定性键 + `has()` 判定后，重复触发直接返回。
 
-1. **空世界**：`getBodyCount()==0`（所有方块已 discard）→ 立即销毁，不等超时。
-2. **超时**：存活超过 `MAX_WORLD_LIFE`（1200 tick = 60 秒）。
-3. **全局清理**：服务器停止 `clearAll()`。
+**向后拖动（回放倒放）**：物理不可逆，`driveTo` 检测到 `localTick < simulatedTick`
+时，按保存的**初始条件**（位置/速度/角速度/质量/摩擦/阻尼）重建全部刚体，
+再以固定步长重新模拟到目标 tick。固定步长 + 固定种子 + 单线程求解器保证结果可复现。
+
+销毁触发条件：
+
+1. **空世界**：动态刚体归零（实体全部 discard）→ 立即销毁。
+2. **回放停止**：`ActionPlayerStopMixin` 注入 BBS `ActionPlayer#stop()`（所有结束路径的唯一汇聚点），
+   销毁该影片的全部物理世界。
+3. **绝对超时**：`simulatedTick > MAX_WORLD_LIFE`（兜底，正常由上面两条清理）。
+4. **全局清理**：服务器停止 `clearAll()`。
+
+**销毁顺序（native 安全的关键）**：① 断开实体引用 → ② `world.close()` → ③ `remove(discard)` 实体。
+顺序反过来会让实体在 native 世界释放后仍持有 `worldPtr` → use-after-free。
+
+> 设计权衡：世界销毁时**只清 Recording，不清 Recovery**——Recovery 是 DamageControl 失效时的存档兜底，
+> 运行时清理不安全（世界销毁时 BBS 可能还没恢复完方块）。Recovery 由 SERVER_STOPPING 的
+> `restoreAll + clearAll` 负责最终清理。Recovery 记录已改为「位置 → 原始状态」去重，内存按位置数封顶。
 
 连带清理的内容与原因（**资源泄漏治理史**）：
 
@@ -584,8 +624,14 @@ Rapier 的 `pipeline.step()` 必须**每个世界每 tick 调用一次**（而�
 - **BlockState 同步陷阱**：`FallingBlockEntity.block` 是 private，且 `initDataTracker()` 里就读 `block.isAir()`。子类公开构造函数无法设置它 → NPE。修复：覆写 `initDataTracker()`，在 super 之前用 `FallingBlockEntityAccessor`（`@Accessor("block")`）把 block 设为 AIR，之后客户端从 spawn 数据包同步真实方块状态。
 - **单位约定**：native 坐标是方块**几何中心**（米）；MC 实体坐标是**脚部**（feet = center - 0.5）；`setVelocity` 用 blocks/tick（÷20 换算 m/s）。
 - **GC 优化**：每 tick 的 JNI 读取复用实例级 `_tmpPos/_tmpRot/_tmpVel/_tmpAngVel` 数组。早期每 tick new 3 个数组 × 500 方块 × 20 tick = 每秒 3 万个临时数组 → GC 风暴；改后零分配。
-- **落地稳定检测**：低速 + 近地连续若干 tick → `settled=true`，停止同步防震荡闪烁。
-- **客户端物理预测（165Hz 核心）**：客户端 tick 只有 20Hz 且 lerp 是直线，而物理下落是二次曲线——lerp 在 165Hz 屏幕上会"看起来 20 帧"。方案：客户端每帧用同步来的速度+重力+阻尼**自主积分预测位置与四元数旋转**，位置包到达时只做 10% 轻校正防发散。另有 **BBS 导出 i=0 帧检测**：导出时 BBS 的 RenderTickCounterMixin 每帧累加 tickDelta，i=0 表示 tick 未推进，此时陈旧速度继续积分会发散 → 检测 `tickAdvanced` 标志，未推进则跳过积分走 lerp 兜底。
+- **落地稳定检测**：低速（< 0.2 m/s）连续 10 tick → `settled=true`，**停止位置/旋转同步**。
+  刚体求解器在静止时仍有亚毫米级微抖，若继续每 tick 同步，客户端会把这点微抖当真实位移插值出来
+  → 方块静止时持续"抽搐"。（旧实现算出了 `settled` 但从未读取，防抖机制其实是死代码。）
+- **客户端插值（高刷新率核心）**：客户端 tick 只有 20Hz 且线性 lerp 是直线，而物理下落是二次曲线，
+  于是 165Hz 屏幕上"看起来只有 20 帧"。解法**不是**开环积分预测（见第 9 章），
+  而是把渲染位置定义为**已确认权威样本之间的插值函数**：
+  位置用**最近 3 个 tick 样本的二次拉格朗日插值**（对恒定加速度精确）、
+  旋转用**最近 2 个 tick 四元数的 slerp**（含符号修正）。纯函数、无累积状态、与帧率无关。
 - **物理记录**：每 tick 把 (tick, blockId, 位置/速度/四元数/角速度/方块状态/休眠) 写入 `PhysicsRecordingManager`（按 replayId 分组，replayId 由 `Replay.getId()` MD5 派生，确定性），为未来的"物理烘焙成关键帧动画"功能积累数据。
 
 ### 6.6 纯 Java 物理引擎（PhysicsEngine，489 行）
@@ -638,21 +684,44 @@ Sable 风格的简化刚体物理，作为原生库不可用时的兜底（也�
 | `BlockSplashReverseScheduler` | 反向飞溅四阶段状态机 | WAITING→RECOVERING（直线插值飞行）→SNAPPING（角度归零）→DONE；动画方块重叠保留防闪烁 |
 | `BlockPathScheduler` | 路径运动 | 每方块 queueIndex × concentration 决定排队间距；黄金角散点；`setPositionWithPrev` 手动管理 prevPos |
 | `BlockSplashAnimationScheduler` | 非 solidify 方块的缩小消失 | 前 N-20 tick 正常物理，最后 20 tick 写 `SHRINK_PROGRESS`（ease-in quadratic：progress²，先慢后快），到 1.0 后 discard；含 +100 tick 强制超时保护 |
-| `PhysicsWorldRegistry.tickAll` | Rapier 世界统一步进 | 见 6.3 |
+| `PhysicsWorldRegistry` | 刚体物理世界的生命周期 + 回放时钟步进 | **不再由 `END_SERVER_TICK` 步进**：物理由 `BlockSplashActionClip.applyRange()` 按回放 tick 驱动（`driveTo`）；`END_SERVER_TICK` 只调用轻量的 `maintenance()` 做失效/空世界/超时清理 |
+
+### 7.1 为什么物理必须挂在 `applyRange` 而不是 `END_SERVER_TICK`
+
+BBS 的 `ActionClip` 提供两个回调，语义完全不同：
+
+| 回调 | 触发时机 | 本插件用它做什么 |
+|---|---|---|
+| `applyAction` | 只在**片段起始 tick**（或 `frequency` 命中时） | 一次性规划：收集方块、清场、建刚体、生成实体 |
+| `applyRange` | **片段覆盖的每一个 tick** | 按回放 tick 推进物理（`driveTo`） |
+
+BBS 的 `ActionPlayer.tick()` 只在回放时钟推进时被调用（`playing=false` 时提前 return），
+`ActionPlayer.goTo(from, to)` 则是**逐 tick 回放**所有 clip。因此把物理挂在 `applyRange` 上，
+天然获得三个"回放规则"必需的语义：
+
+```
+暂停回放  → applyRange 不被调用 → 物理定格（可以拍定格镜头）
+播放回放  → 每个回放 tick 调用一次 → 物理 1:1 跟随
+拖动时间轴 → 与拖动方向一致地逐 tick 调用 → 物理随拖动推进 / 触发确定性回退重放
+导出视频  → 回放时钟驱动 → 与实时预览逐帧一致（可复现）
+```
+
+旧实现挂在 `END_SERVER_TICK` 上，导致暂停时方块仍在继续下落，**对短片拍摄是致命的**。
 
 所有调度器都有 `clearAll()`（SERVER_STOPPING 时调用：销毁实体/恢复方块/清任务）与 `getActiveTaskCount()`（调试）。
 
 ---
 
-## 8. Mixin 注入体系（14 个 Mixin）
+## 8. Mixin 注入体系（15 个 Mixin）
 
-### 8.1 服务端/公共（bbsblocksplash.mixins.json，5 个）
+### 8.1 服务端/公共（bbsblocksplash.mixins.json，6 个）
 
 | Mixin | 目标 | 注入点 | 作用 |
 |---|---|---|---|
+| `ActionPlayerStopMixin` | BBS `ActionPlayer` | `stop()` HEAD | **回放停止钩子**：BBS 的 DamageControl 只管方块，不管本插件 spawn 的物理实体。在所有回放结束路径（播完/编辑器停止/断线/关服）的唯一汇聚点销毁本插件为该影片建立的物理世界与实体——否则遗留实体持有已释放的 `worldPtr` → 抽搐/崩溃 |
 | `BbsEntityMixin` | `Entity`（class_1297） | `isOnGround()` HEAD 可取消 | **非实体化模式的核心**：NO_SOLIDIFY=true 时强制返回 false，骗过原版"落地变方块"判定。放在 Entity 层是因为 `isOnGround()` 定义在 Entity，Loom remap 只查目标类直接方法表，放在 FallingBlockEntity mixin 上会映射失败 |
 | `FallingBlockEntityDataMixin` | `FallingBlockEntity` | `initDataTracker()` RETURN | 注册 15 个自定义 TrackedData 字段（见 8.3） |
-| `FallingBlockEntityPhysicsMixin` | `FallingBlockEntity` | `tick()` HEAD + RETURN（644 行） | HEAD：NO_SOLIDIFY 时重置 `timeFalling=0`（防原版 600 tick 超时 dropItem+discard）；RETURN：对标记实体注入 RotatingFallingBlockManager 完整物理（弹跳/摩擦/旋转/实体碰撞/休眠），并记录落地方块位置供退出恢复 |
+| `FallingBlockEntityPhysicsMixin` | `FallingBlockEntity` | `tick()` HEAD + RETURN（644 行） | HEAD：NO_SOLIDIFY 时重置 `timeFalling=0`（防原版 600 tick 超时 dropItem+discard）；RETURN：对标记实体注入 RotatingFallingBlockManager 完整物理（弹跳/摩擦/旋转/实体碰撞/休眠），并记录落地方块位置供退出恢复。通过 `isRotating()` 守门，`PhysicsBlockEntity` 不受影响 |
 | `EntityAccessor` | `Entity` | @Accessor 接口 | 暴露 private 的 `onGround` 与 `prevX/prevY/prevZ`（手动管理渲染插值锚点） |
 | `FallingBlockEntityAccessor` | `FallingBlockEntity` | @Accessor 接口 | 暴露 private 的 `block` 字段（PhysicsBlockEntity 构造必需；方法带 `bbs$` 前缀防与其他 Mixin 冲突——AbstractMethodError 教训） |
 
@@ -685,30 +754,92 @@ Sable 风格的简化刚体物理，作为原生库不可用时的兜底（也�
 
 ---
 
-## 9. 网络同步与 165Hz 高刷新率渲染
+## 9. 网络同步与高刷新率渲染
 
-这是本插件工程含量最高的部分。问题链与解法：
+这是本插件工程含量最高的部分。核心结论只有一个：
+
+> **客户端不做物理预测，只做插值。**
+
+### 9.1 为什么"预测"是错的（第一性原理）
+
+直觉方案是：客户端每帧用同步来的速度 + 重力积分往前推，位置包到达时按比例校正。
+这个方案在数学上是一个**正反馈回路**：
 
 ```
-问题：MC 逻辑 20Hz，玩家屏幕 144/165Hz
-  ├─ 旋转卡顿：DataTracker 每 tick（50ms）同步角度 → 同一 tick 内每帧角度相同
-  │    解法①：服务端同步"角速度"而非只有角度
-  │    解法②：客户端 ClientRotationStateManager 每帧自积分
-  │            旋转增量 = 角速度 × (当前tickDelta - 上一帧tickDelta)
-  │            每 tick 用服务端角度校准一次防累积误差
-  │
-  ├─ 物理下落不自然：lerp 是直线，物理是二次曲线（重力加速）
-  │    解法：PhysicsBlockEntity 客户端自主物理预测
-  │            每帧用同步来的 v/g/阻尼积分预测位置+四元数
-  │            位置包到达只做 10% 轻校正防发散
-  │            （附 BBS 导出 i=0 帧检测：tick 未推进时跳过积分）
-  │
-  └─ 路径运动位置只有 20 帧：客户端 tick 里 prevX=getX() 把插值锚点抹平
-       解法①：PATH_MOVEMENT 标志 → 客户端 Mixin 取消整个 tick()
-       解法②：服务端 setPositionWithPrev 手动管理 prevPos
+误差 e  →  积分放大  →  校正不足  →  误差更大  →  ...
 ```
 
-另外一组经验：`prevRenderRotation/renderRotation` 独立维护四元数插值（`Quaternionf.slerp` 语义），`lastTickDelta` 存在**每个实体实例**上而非渲染器单例（多方块场景每方块独立计算帧增量，避免慢动作 bug）。
+只要网络有丢包 / 合并 / 延迟（这是结构性事实），校正源就不是连续可用的，
+于是预测值会持续漂移，再被不连续的校正拉回 —— 方块看起来"不跟随物理运动、原地随意抽搐"。
+
+历史实现还叠了三个具体缺陷，把抖动放大到肉眼可见：
+
+| 缺陷 | 后果 |
+|---|---|
+| `getRenderX/Y/Z` 在「预测值」和「lerp 值」之间**逐帧切换**（`predictionSkippedThisFrame`） | 同一 tick 内第一帧用预测位置、后续帧用 lerp 位置，两者数值不同 → 20Hz 的来回跳变 |
+| 每帧无条件积分重力 + 每 tick 只做 20% 校正 | 静止/贴地方块每帧下沉、每 tick 被拉回 → 周期性抖动 |
+| 客户端预测角速度从未到达客户端（`setClientPhysicsParams` 只在服务端实体实例上调用，不是 DataTracker 字段） | 旋转预测是空转，渲染旋转也在两个源之间切换 |
+
+### 9.2 正确解法：把渲染位置定义为权威样本之间的插值
+
+MC 的逻辑是 20 TPS，渲染可以是任意帧率。客户端每 tick 收到一个**权威样本**
+（`EntityS2CPacket` / `EntityPositionS2CPacket` 会同时推进 `pos` 与 `lastRender`），
+渲染要做的是在样本之间取值。位置用一条曲线把它们连起来：
+
+```
+样本位于 t = -1, 0, +1（单位 tick），取值为 a, b, c
+τ = tickDelta ∈ [0,1]，渲染 t ∈ [0,1] 之间的位置
+
+p(τ) = a·τ(τ-1)/2 + b·(1-τ²) + c·τ(τ+1)/2      ← 二次拉格朗日插值
+```
+
+这个表达式的性质正是我们需要的：
+
+- **对恒定加速度精确**。自由落体是二次曲线，二次插值与真实轨迹完全重合
+  （线性 lerp 的误差是 O(T²)，视觉上就是"20 帧感"）。
+- **纯函数、无累积状态** → 不漂移、不抖动、发散不可能发生。
+- **与帧率无关** → 60Hz 实时预览、165Hz 显示器、BBS 离线导出（任意帧率、任意拖动位置）
+  得到逐帧一致的结果，这是"为短片开发"的硬需求。
+- **不需要额外同步速度** → 零额外带宽。
+
+旋转用**最近 2 个权威四元数的 slerp**（含 `q`/`-q` 符号修正，否则会走远路导致旋转抽帧）。
+
+### 9.3 渲染矩阵：必须先"抵消"再"偏移"
+
+MC 渲染实体的矩阵原点并不是 `entity.getX()`，而是（`WorldRenderer#method_22977`）：
+
+```java
+base = lerp(tickDelta, entity.lastRenderX, entity.getX())
+```
+
+同时 `FallingBlockEntityRenderer` 内部还会 `translate(-0.5, 0, -0.5)` 再画 0..1 的方块模型，
+即方块中心 = `(baseX, baseY + 0.5, baseZ)`。因此渲染器必须：
+
+```java
+matrices.push();
+matrices.translate(renderCenter - (baseX, baseY + 0.5, baseZ));  // 抵消 + 偏移，一步到位
+matrices.translate(0, 0.5, 0);
+matrices.multiply(renderRotation);                               // 绕方块几何中心旋转
+matrices.translate(0, -0.5, 0);
+super.render(...);
+matrices.pop();
+```
+
+用**同一个** `base` 做抵消，offset 才不会随 `tickDelta` 摆动（这是"抽搐"最直接的一类来源）。
+
+### 9.4 原版实体路径（非 PhysicsBlockEntity）
+
+原版 `FallingBlockEntity` 路径另有两条既有经验，与本插件其它特效共用：
+
+```
+问题：旋转卡顿 —— DataTracker 每 tick（50ms）同步角度 → 同一 tick 内每帧角度相同
+  解法①：服务端同步"角速度"而非只有角度
+  解法②：客户端 ClientRotationStateManager 每帧自积分 + 每 tick 校准一次防累积误差
+
+问题：路径运动位置只有 20 帧 —— 客户端 tick 里 prevX = getX() 把插值锚点抹平
+  解法①：PATH_MOVEMENT 标志 → 客户端 Mixin 取消整个 tick()
+  解法②：服务端 setPositionWithPrev 手动管理 prevPos
+```
 
 ---
 
@@ -754,10 +885,14 @@ Sable 风格的简化刚体物理，作为原生库不可用时的兜底（也�
 | 区域方块数 | 30,000 上限，超出拒绝执行 | 防卡死 |
 | 物理方块抽样 | 2×2×2 分组抽样至 maxPhysicsBlocks（默认 300；i3-10105 建议 300，高端机可 500–1000） | 刚体数量 × 每 tick 2 子步的 CPU 开销 |
 | 静态碰撞体 | 2000 个上限 | Rapier 世界内存 |
-| 空 world 即销毁 | getBodyCount()==0 → 立即销毁 | 不等 60s 超时，白跑 step 纯浪费 |
+| 空 world 即销毁 | getBodyCount()==0 → 立即销毁 | 不白跑 step |
 | Recording 清理 | 世界销毁连带清（43MB/回放） | "越播越卡"根因 |
+| Recovery 记录去重 | 「位置 → 原始状态」Map（putIfAbsent） | 内存按位置数封顶，不再随回放次数线性增长 |
 | JNI 零分配 | 实例级复用临时数组 | 3 万临时数组/秒 → 0 |
-| 实体 GC | 每实体 settled 检测停同步；客户端旋转状态 >50 个时清理 5 秒未访问项 | 减少无谓同步/内存 |
+| native 安全闸门 | `isValid()` 前置判断 + 读取类方法安全默认值 | 消除 worldPtr 释放后的 use-after-free |
+| 静止停同步 | 低速 10 tick → `settled` 停止位置/旋转同步 | 求解器亚毫米微抖不传播到客户端（防静止抽搐） |
+| 实体 GC | 客户端旋转状态 >50 个时清理 5 秒未访问项 | 减少无谓内存 |
+| 回退重放预算 | 单次 `driveTo` 最多 60 步 | 长时间倒拖不会阻塞服务器主线程 |
 | 线程安全 | 调度器 CopyOnWriteArrayList、Recovery/Registry ConcurrentHashMap | 服务端 tick 与事件回调并发 |
 | 碰撞去重 | 实体对只由 UUID 较小方处理；AABB 近邻查询 O(N)（100–300 方块够用） | 避免双重冲量 |
 
@@ -930,3 +1065,62 @@ Sable 风格的简化刚体物理，作为原生库不可用时的兜底（也�
 - 原始源码包：`releases/bbs-Block_Splash-2.0.4-sources.jar`
 
 本项目以 **MIT** 许可证发布（与 BBS 一致）。欢迎 fork、二次创作，但请保留原作者署名。
+
+---
+
+## 16. 修复记录（"方块不受物理控制、随机抽搐"专项）
+
+本节记录一次以第一性原理为起点的排查与修复，主症状是
+**区域内方块不沿刚体轨迹运动，而是原地剧烈抖动 / 抽搐**，并伴随"回放不像回放"的问题。
+
+### 16.1 症状 → 根因对照表
+
+| # | 症状 | 根因 | 修复 |
+|---|---|---|---|
+| 1 | 方块在两个位置之间以 ~20Hz 来回跳 | 渲染位置在「客户端预测值」与「lerp 值」之间**逐帧切换**（`predictionSkippedThisFrame`）；两者数值不同 | 删除整套开环预测，改为「权威样本之间的插值」单一数据源 |
+| 2 | 方块移动滞后 / 追不上刚体 | `tickAdvanced` 只在客户端 tick 置位、每渲染帧消费一次，导致每 tick 实际只积分到一个 **dt ≈ 0** 的步长；预测几乎被冻结，只剩 20%/tick 的滞后校正 | 同上（插值无需速度与 dt） |
+| 3 | 静止的方块持续微抖 | 每帧无条件积分重力 + 每 tick 只做 20% 校正 → 低位振荡；`settled` 被算出但从未读取（死代码） | 用二次插值（对恒定加速度精确）；`settled` 真正落地为"停止同步" |
+| 4 | 旋转也在抖动 / 顿挫 | `setClientPhysicsParams()` 只在**服务端**实体实例上调用（不是 DataTracker 字段），客户端的预测角速度恒为 0，旋转预测是空转；渲染旋转同样在两个源之间切换 | 旋转改为两样本 slerp（含 `q`/`-q` 符号修正） |
+| 5 | 部分方块穿过地面掉进虚空后乱弹 | `injectStaticCollisionBlocks()` 达到 2000 上限时**整体 `return`**（而非中断单个方块的注入），导致排在后面的方块完全没有地面；且"每方块 × 半径 8 立方体"的遍历方式本身就与体积同阶 | 改为只注入"承力几何"（每列地板 + 外壳侧墙），注入量与表面积同阶；达到上限只跳过不中断 |
+| 6 | 播放/重播若干次后出现重叠方块互相挤压 | `applyAction` **非幂等**：BBS `ActionPlayer.goTo()` 拖动时间轴时会逐 tick 重放 `applyAction`，每次都新建物理世界 + 在同一位置再生成最多 300 个刚体 | worldKey 由「filmId + replayId + 片段起始 tick」派生，重复触发直接返回 |
+| 7 | 回放暂停时方块仍在继续下落 | 物理步进挂在 `ServerTickEvents.END_SERVER_TICK`，与回放时钟无关 | 物理改由 `ActionClip.applyRange()` 驱动（暂停不调用 → 物理定格） |
+| 8 | 拖动时间轴 / 导出视频结果对不上 | 同上；且客户端预测依赖逐帧 dt，帧率一变结果就变 | 回放时钟驱动 + 帧率无关的插值函数 |
+| 9 | 回放停止后世界中残留大量下落方块，下次拍摄越来越乱 | BBS 的 `DamageControl` **只记录方块变更，不记录本插件 spawn 的实体** | 新增 `ActionPlayerStopMixin`：在 `ActionPlayer#stop()`（所有结束路径的唯一汇聚点）销毁本插件为该影片建立的物理世界与实体 |
+| 10 | 物理世界销毁后方块瞬移到垃圾坐标 / 随机抽搐 / 偶发崩溃 | worldPtr 释放后实体仍持有句柄 → 后续 `nGetBodyTransform` / `nRemoveBody` 是 **use-after-free**；且实体 `MAX_LIFE`(1200) 与世界 `MAX_WORLD_LIFE`(1200) 相同，存在竞态 | `PhysicsBlockEntity` 所有 native 调用前检查 `isValid()`，失效即自毁；`NativePhysicsWorld` / `JoltPhysicsWorld` 全部读写方法加 `valid` 闸门（读取类写入安全默认值）；销毁顺序固定为「断开实体 → 关世界 → 移除实体」 |
+| 11 | 反向飞溅/振波方块卡墙、卡地 | （既有实现保留，未改动） | — |
+
+### 16.2 回放规则对齐清单
+
+| BBS 规则 | 本插件的应对 |
+|---|---|
+| `applyAction` 只在片段起点触发，且拖动时会**重复**触发 | 用确定性 worldKey 做幂等，重复触发不产生副作用 |
+| `applyRange` 覆盖片段全部 tick，且只在回放时钟推进时调用 | 物理步进唯一入口（`driveTo`） |
+| 暂停 = 时钟不推进 | 物理定格 |
+| 拖动 = 逐 tick 行走 | 前进逐 tick 步进；后退按初始条件重建刚体后重新模拟（步数预算 60/次） |
+| 导出 = 同一时间轴应当复现 | 渲染与物理都与帧率无关、由回放 tick 决定 |
+| 停止 = 世界必须复原 | 方块交给 `DamageControl`；本插件实体与刚体交给 `ActionPlayerStopMixin` 钩子 |
+
+### 16.3 行为变化（使用上需要知道）
+
+1. **物理的存活范围现在等于片段的长度**。片段结束后 `applyRange` 不再被调用，物理随之停止——
+   这是 BBS 的语义（clip = 效果的窗口）。需要更长的物理演出，请把片段拉长。
+2. **`solidify=true`** 的方块现在会一直留在地上直到回放停止（旧版 60 秒后被强制 `discard`）。
+3. **`solidify=false`** 时存活上限改由 `animationDuration` 决定（以回放 tick 计，暂停不计寿命）。
+4. 向后拖动时间轴会触发一次"重建 + 重新模拟"，大规模场景（300+ 刚体）倒拖时会有轻微卡顿，
+   已用 60 步/次的预算限制最坏情况。
+
+### 16.4 详细报告
+
+完整的问题清单、根因分析与验证说明见 `docs/`：
+
+| 文档 | 内容 |
+|---|---|
+| [`docs/方块飞溅_代码审计与修复报告.md`](docs/方块飞溅_代码审计与修复报告.md) | **全库系统性审计**：审计方法（八条公理）、23 项缺陷清单（P0×2 / P1×13 / P2×6 / P3×2）、根因分析、修复明细、字节码级验证说明、未修复项 |
+| [`docs/方块飞溅_物理与回放修复报告.md`](docs/方块飞溅_物理与回放修复报告.md) | 物理与回放专项：抽搐的四条根因链、BBS 回放规则对齐、生命周期设计 |
+
+> 两个最值得记住的坑（详见审计报告 §4）：
+> 1. **`@Accessor` 方法名绝不能与目标类已有方法同名** —— 否则 Mixin 认为接口方法已被满足，
+>    不会生成访问器实现，调用会静默落到 vanilla 方法上。本仓库统一用 `bbs$` 前缀规避。
+> 2. **`static` 物理状态表在单机下是两端共享的** —— 客户端与服务端同 JVM、同 UUID，
+>    物理入口必须用 `World.isClient` 守卫，否则两端互相施加速度、互相删除状态。
+

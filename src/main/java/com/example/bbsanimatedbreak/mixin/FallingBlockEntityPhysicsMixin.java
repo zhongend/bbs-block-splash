@@ -92,6 +92,18 @@ public abstract class FallingBlockEntityPhysicsMixin
     {
         class_1540 self = (class_1540) (Object) this;
         UUID uuid = self.method_5667();
+        class_1937 tickWorld = self.method_37908();
+
+        // === 只在服务端推进物理（关键） ===
+        // PhysicsState 表是 static；单机（集成服务器）下客户端与服务端实体共享
+        // 同一 JVM、UUID 也相同，而 IS_ROTATING 会经 DataTracker 同步到客户端。
+        // 若不在此拦截：客户端 tick 会命中服务端的物理状态并重复施加速度/位置，
+        // 还会在实体移除分支调用 removePhysics(uuid) 把服务端状态删掉，
+        // 造成客户端与服务端物理互相打架（抖动、瞬移、状态凭空丢失）。
+        if (tickWorld == null || tickWorld.field_9236)
+        {
+            return;
+        }
 
         // 只处理被标记的飞溅方块
         if (!RotatingFallingBlockManager.isRotating(self))
@@ -142,7 +154,11 @@ public abstract class FallingBlockEntityPhysicsMixin
         }
 
         // 通过 Accessor 读取 private 字段 onGround
-        boolean onGround = ((EntityAccessor) self).isOnGround();
+        // 必须用 bbs$ 前缀的访问器：vanilla 的 Entity.isOnGround() 被
+        // BbsEntityMixin 对 NO_SOLIDIFY 实体强制返回 false（用来骗过"落地变方块"），
+        // 若误调 vanilla 方法会得到恒为 false 的 onGround，
+        // 导致落地弹跳 / 地面摩擦 / 旋转平滑归零全部失效。
+        boolean onGround = ((EntityAccessor) self).bbs$isOnGround();
 
         // 更新地面状态
         state.onGround = onGround;
@@ -211,6 +227,17 @@ public abstract class FallingBlockEntityPhysicsMixin
             this.resolveBlockStuck(self, world);
         }
 
+        // === 2.8 重新读取速度（关键） ===
+        // 上面 handleGroundBounce / handleWallBounce / resolveBlockStuck 都通过
+        // setVelocity 改写了实体速度，但 velocity / speed / horizontalSpeed 是
+        // 碰撞发生之前的快照。若继续用旧快照计算摩擦与空气阻力并回写，
+        // 会把刚设置的弹跳 Y 速度与撞墙反弹速度整体覆盖 →
+        // 落地不再弹起、撞墙不再反射（方块像"粘"在地上）。
+        velocity = self.method_18798();
+        speed = (float) velocity.method_1033();
+        horizontalSpeed = (float) Math.sqrt(velocity.field_1352 * velocity.field_1352
+                                          + velocity.field_1350 * velocity.field_1350);
+
         // === 3. 地面摩擦 ===
         if (onGround && horizontalSpeed > 0.01F)
         {
@@ -269,8 +296,8 @@ public abstract class FallingBlockEntityPhysicsMixin
                                      RotatingFallingBlockManager.PhysicsState state,
                                      class_243 velocity, float speed, float horizontalSpeed)
     {
-        state.bounceCount++;
-
+        // 注意：bounceCount 由本方法末尾必然调用的 state.onGroundCollision() 自增一次。
+        // 这里不能再自增，否则每次触地 +2 → 弹跳衰减与次数上限被翻倍。
         // 计算弹跳恢复系数：每次弹跳衰减
         float bounceFactor = Math.max(0.1F, state.restitution - state.bounceCount * 0.08F);
 

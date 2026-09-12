@@ -39,6 +39,33 @@ public class RotatingFallingBlockManager
      */
     public static class PhysicsState
     {
+        /**
+         * 确定性随机源状态（xorshift64* 内部状态）
+         *
+         * 碰撞响应里的"随机力矩"必须可复现（同一回放两次播放结果一致），
+         * 因此不能用 new Random()（纳秒时间播种），
+         * 改用由实体 UUID 派生的固定种子。
+         */
+        public long rngSeed = 0x9E3779B97F4A7C15L;
+
+        /** 确定性随机数 [0,1)（xorshift64*，零分配、无外部状态） */
+        private float randUnit()
+        {
+            long x = this.rngSeed;
+            x ^= x << 13;
+            x ^= x >>> 7;
+            x ^= x << 17;
+            this.rngSeed = x;
+
+            return ((x >>> 40) & 0xFFFFFFL) / (float) 0x1000000;
+        }
+
+        /** 确定性随机力矩（居中：-0.5 ~ +0.5 倍幅值） */
+        private float randTorque(float amplitude)
+        {
+            return (this.randUnit() - 0.5F) * amplitude;
+        }
+
         // === 旋转状态 ===
         public float angularVelocityX;
         public float angularVelocityY;
@@ -239,11 +266,10 @@ public class RotatingFallingBlockManager
             // 碰撞冲击产生随机力矩（不规则碰撞的真实表现）
             if (impactSpeed > 0.4F)
             {
-                Random rng = new Random();
                 float torque = impactSpeed * 2.5F;
-                this.angularVelocityX += (rng.nextFloat() - 0.5F) * torque;
-                this.angularVelocityZ += (rng.nextFloat() - 0.5F) * torque;
-                this.angularVelocityY += (rng.nextFloat() - 0.5F) * torque * 0.2F;
+                this.angularVelocityX += this.randTorque(torque);
+                this.angularVelocityZ += this.randTorque(torque);
+                this.angularVelocityY += this.randTorque(torque * 0.2F);
             }
         }
 
@@ -265,12 +291,11 @@ public class RotatingFallingBlockManager
             // 撞墙产生旋转（力臂效应）
             if (impactSpeed > 0.2F)
             {
-                Random rng = new Random();
                 float torque = impactSpeed * 4.0F;
                 // 撞墙主要产生 Y 轴旋转（偏航）和少量 X/Z 旋转
-                this.angularVelocityY += (rng.nextFloat() - 0.5F) * torque;
-                this.angularVelocityX += (rng.nextFloat() - 0.5F) * torque * 0.5F;
-                this.angularVelocityZ += (rng.nextFloat() - 0.5F) * torque * 0.5F;
+                this.angularVelocityY += this.randTorque(torque);
+                this.angularVelocityX += this.randTorque(torque * 0.5F);
+                this.angularVelocityZ += this.randTorque(torque * 0.5F);
             }
         }
 
@@ -292,11 +317,10 @@ public class RotatingFallingBlockManager
 
             if (impactSpeed > 0.15F)
             {
-                Random rng = new Random();
                 float torque = impactSpeed * 2.5F;
-                this.angularVelocityX += (rng.nextFloat() - 0.5F) * torque;
-                this.angularVelocityY += (rng.nextFloat() - 0.5F) * torque;
-                this.angularVelocityZ += (rng.nextFloat() - 0.5F) * torque;
+                this.angularVelocityX += this.randTorque(torque);
+                this.angularVelocityY += this.randTorque(torque);
+                this.angularVelocityZ += this.randTorque(torque);
             }
         }
     }
@@ -331,13 +355,16 @@ public class RotatingFallingBlockManager
         }
 
         // 用 DataTracker 设置旋转标志（自动同步到客户端）
+        // 若写入失败，isRotating() 会恒为 false → mixin 直接 return，
+        // 永远走不到 removePhysics → 下面 put 进去的状态将永久泄漏。
+        // 因此写入失败时直接放弃标记。
         try
         {
             falling.method_5841().method_12778(FallingBlockRotationData.IS_ROTATING, true);
         }
         catch (Exception e)
         {
-            // DataTracker 可能未初始化，忽略
+            return;
         }
 
         // === 真实物理旋转：根据线速度计算角速度 ===
@@ -349,7 +376,10 @@ public class RotatingFallingBlockManager
         class_243 vel = falling.method_18798();
         double speed = vel.method_1033();
 
-        Random rng = new Random(falling.method_5667().getMostSignificantBits() ^ System.nanoTime());
+        // 确定性种子：只依赖实体 UUID，不用 System.nanoTime()
+        // （否则同一回放两次播放的初始角速度不同，轨迹无法复现）
+        Random rng = new Random(falling.method_5667().getMostSignificantBits()
+                              ^ falling.method_5667().getLeastSignificantBits());
 
         float avx, avy, avz;
 
@@ -412,7 +442,11 @@ public class RotatingFallingBlockManager
             avz = (rng.nextFloat() - 0.5F) * 8F;
         }
 
-        physicsStates.put(falling.method_5667(), new PhysicsState(avx, avy, avz));
+        PhysicsState state = new PhysicsState(avx, avy, avz);
+        // 非零确定性种子（xorshift 在 0 处是不动点，会恒定输出 0）
+        state.rngSeed = (falling.method_5667().getMostSignificantBits()
+                       ^ falling.method_5667().getLeastSignificantBits()) | 1L;
+        physicsStates.put(falling.method_5667(), state);
     }
 
     /**
@@ -444,6 +478,11 @@ public class RotatingFallingBlockManager
                                      boolean smoothRotationStop, double rotationStopDistance,
                                      int rotationResetDuration, boolean disableCollision)
     {
+        if (falling == null || falling.method_5667() == null)
+        {
+            return;
+        }
+
         markRotating(falling);
 
         PhysicsState state = physicsStates.get(falling.method_5667());

@@ -4,6 +4,7 @@
     "package": "com.example.bbsanimatedbreak.mixin",
     "compatibilityLevel": "JAVA_17",
     "mixins": [
+        "ActionPlayerStopMixin",
         "BbsEntityMixin",
         "EntityAccessor",
         "FallingBlockEntityAccessor",

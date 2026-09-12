@@ -1,8 +1,6 @@
 package com.example.bbsanimatedbreak;
 
-import java.util.ArrayList;
 import java.util.HashSet;
-import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -43,31 +41,23 @@ import net.minecraft.class_3218;
 public class BlockSplashRecoveryManager
 {
     /**
-     * 单个方块的原始状态记录
-     */
-    public static class BlockRecord
-    {
-        public final class_2338 pos;
-        public final class_2680 originalState;
-
-        public BlockRecord(class_2338 pos, class_2680 originalState)
-        {
-            this.pos = pos.method_10062(); // 必须 toImmutable，BlockPos 可能是可变的
-            this.originalState = originalState;
-        }
-    }
-
-    /**
      * 每个世界的飞溅记录
      */
     private static class WorldRecord
     {
-        /** 被飞溅的方块原始状态列表（退出时恢复为原始状态） */
-        final List<BlockRecord> blocks = new ArrayList<>();
+        /**
+         * 被飞溅的方块原始状态（退出时恢复为原始状态）
+         *
+         * 用「位置 → 原始状态」的 Map 而不是 List：
+         * - 同一个方块被多次飞溅时只保留<b>第一次</b>的原始状态（那才是真正的"原状"）
+         * - 内存被"不同位置数"封顶，不会随回放次数无限增长
+         *   （旧实现用 List 追加，反复拍摄同一场景会让记录线性膨胀）
+         */
+        final java.util.Map<class_2338, class_2680> blocks = new java.util.LinkedHashMap<>();
         /** 飞溅实体落地后变成的方块位置（退出时设为空气） */
         final Set<class_2338> landedBlocks = new HashSet<>();
-        /** 生成的 FallingBlockEntity UUID 列表 */
-        final List<UUID> entityUuids = new ArrayList<>();
+        /** 生成的 FallingBlockEntity UUID（去重） */
+        final Set<UUID> entityUuids = new java.util.LinkedHashSet<>();
         /** 世界维度 ID（用于恢复时找到对应世界） */
         final net.minecraft.class_5321<class_1937> dimensionKey;
         /** 记录创建时间（用于超时清理） */
@@ -98,7 +88,8 @@ public class BlockSplashRecoveryManager
         if (world == null || pos == null || originalState == null) return;
 
         WorldRecord record = records.computeIfAbsent(world.method_27983(), WorldRecord::new);
-        record.blocks.add(new BlockRecord(pos, originalState));
+        // putIfAbsent：同一位置反复飞溅时保留最初的原始状态，并防止记录无限增长
+        record.blocks.putIfAbsent(pos.method_10062(), originalState); // 必须 toImmutable，BlockPos 可能是可变的
     }
 
     /**
@@ -189,13 +180,13 @@ public class BlockSplashRecoveryManager
         }
 
         // 3. 恢复原始方块状态（把原区域设回原状）
-        for (BlockRecord br : record.blocks)
+        for (java.util.Map.Entry<class_2338, class_2680> br : record.blocks.entrySet())
         {
             try
             {
                 // 直接设置方块状态，不触发方块更新（避免连锁反应）
                 // force=false, notifyListeners=false（第 3 个参数）
-                world.method_8652(br.pos, br.originalState, 0x12);
+                world.method_8652(br.getKey(), br.getValue(), 0x12);
             }
             catch (Exception e)
             {

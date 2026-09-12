@@ -399,7 +399,12 @@ public class BlockSelection extends ValueGroup
 
             if ((zi > pz) != (zj > pz))
             {
-                double xIntersect = (zj - zi) * (px - xi) / (zj - zi + 1e-10) + xi;
+                // 射线法：求边 (xi,zi)-(xj,zj) 与水平线 z=pz 的交点 x
+                //   x = xi + (pz - zi) * (xj - xi) / (zj - zi)
+                // 外层条件 (zi > pz) != (zj > pz) 已保证 zj != zi，无需 eps。
+                // 原实现写成 (zj-zi)*(px-xi)/(zj-zi+1e-10)+xi ≈ px，
+                // 使判断退化为与多边形几何无关 → 多边形选区结果整体错误。
+                double xIntersect = xi + (pz - zi) * (xj - xi) / (zj - zi);
 
                 if (px < xIntersect)
                 {

@@ -19,6 +19,16 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public final class PhysicsRecordingManager
 {
+    /**
+     * 每个回放的记录条数上限
+     *
+     * 记录粒度是「每方块每 tick 一条」，而目前没有任何消费者（是为后续"物理烘焙成
+     * 关键帧"预留的）。若不设上限，300 方块 × 长回放会产生千万级不可变对象，
+     * 堆内存持续增长直至 OOM。达到上限后停止记录：既保住"可烘焙"的用途，
+     * 又让内存占用有界（12 万条 ≈ 14 MB/回放）。
+     */
+    private static final int MAX_RECORDS_PER_REPLAY = 120_000;
+
     /** 按 replayId 分组的记录列表 */
     private static final Map<UUID, List<PhysicsRecording>> recordings = new ConcurrentHashMap<>();
 
@@ -40,7 +50,15 @@ public final class PhysicsRecordingManager
      */
     public static void record(UUID replayId, PhysicsRecording recording)
     {
-        recordings.computeIfAbsent(replayId, k -> Collections.synchronizedList(new ArrayList<>())).add(recording);
+        List<PhysicsRecording> list = recordings.computeIfAbsent(
+            replayId, k -> Collections.synchronizedList(new ArrayList<>()));
+
+        if (list.size() >= MAX_RECORDS_PER_REPLAY)
+        {
+            return; /* 已达上限：停止记录，避免无界增长 */
+        }
+
+        list.add(recording);
     }
 
     /**

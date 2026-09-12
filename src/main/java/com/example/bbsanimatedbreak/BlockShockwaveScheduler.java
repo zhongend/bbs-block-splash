@@ -11,7 +11,6 @@ import net.minecraft.class_1540;
 import net.minecraft.class_2338;
 import net.minecraft.class_2680;
 import net.minecraft.class_3218;
-import net.minecraft.class_5819;
 
 /**
  * 方块振波调度器
@@ -144,6 +143,17 @@ public class BlockShockwaveScheduler
     private static final ConcurrentHashMap<UUID, ShakeTask> entityToTask = new ConcurrentHashMap<>();
 
     /**
+     * 已排入队列、尚未结束的震动任务位置（按世界分组）
+     *
+     * 用于 applyAction 的幂等：BBS 拖动时间轴时会逐 tick 重放 applyAction，
+     * 若不去重，同一坐标会被排入多个任务，之后各自 startShake / 恢复，
+     * 对该 pos 交替 setBlockState 与生成实体 → 方块重复、错位、抽搐。
+     * 任务结束时释放该位置，允许后续片段再次震动同一方块。
+     */
+    private static final java.util.Map<class_3218, java.util.Set<class_2338>> scheduledPositions
+        = new ConcurrentHashMap<>();
+
+    /**
      * 调度一个方块的震动任务
      *
      * @param world 世界
@@ -172,6 +182,15 @@ public class BlockShockwaveScheduler
                                       boolean fromCenter, String direction, String shakeMode)
     {
         if (world == null || pos == null || originalState == null) return;
+
+        // === 幂等去重（关键） ===
+        java.util.Set<class_2338> scheduled = scheduledPositions
+            .computeIfAbsent(world, w -> ConcurrentHashMap.newKeySet());
+
+        if (!scheduled.add(pos.method_10062()))
+        {
+            return;
+        }
 
         ShakeTask task = new ShakeTask(
             world, pos, originalState, delay, amplitude,
@@ -208,6 +227,7 @@ public class BlockShockwaveScheduler
             if (task.finished)
             {
                 tasks.remove(task);
+                releaseScheduled(task);
             }
         }
     }
@@ -316,18 +336,26 @@ public class BlockShockwaveScheduler
     {
         // 计算这次震动的幅度
         double currentAmplitude;
-        class_5819 rng = task.world.method_8409();
+
+        // 确定性随机源（替代 World 的全局随机源 world.getRandom()）：
+        // 全局随机源的消费序列取决于同 tick 其它随机调用的次数，
+        // 会让同一回放两次播放的幅度/间隔不同，破坏"回放可复现"。
+        long rngSeed = task.pos.method_10063() * 0x9E3779B97F4A7C15L
+                     ^ (long) task.currentShakeCount * 0xBF58476D1CE4E5B9L;
+
+        // 倾斜扰动的确定性种子（与幅度用不同常量错开，避免两者序列相关）
+        long tiltSeed = rngSeed ^ 0xA0761D6478BD642FL;
 
         if ("earthquake".equals(task.shakeMode))
         {
             // 地震模式：幅度随机波动（不衰减，模拟持续地震活动）
             // 幅度在 0.5×~1.3× 之间随机
-            currentAmplitude = task.amplitude * (0.5 + rng.method_43058() * 0.8);
+            currentAmplitude = task.amplitude * (0.5 + detUnit(rngSeed) * 0.8);
         }
         else if ("chaos".equals(task.shakeMode))
         {
             // 混沌模式：幅度完全随机（可能很大也可能很小）
-            currentAmplitude = task.amplitude * rng.method_43058() * 1.5;
+            currentAmplitude = task.amplitude * detUnit(rngSeed ^ 0x2545F4914F6CDD1DL) * 1.5;
         }
         else if ("ripple".equals(task.shakeMode))
         {
@@ -449,7 +477,6 @@ public class BlockShockwaveScheduler
         if (task.useRealisticAngle)
         {
             float tiltX = 0, tiltZ = 0;
-            // rng 已在方法开头定义
 
             // 距离衰减计算（所有模式通用）
             double dy = task.centerY - task.pos.method_10264();
@@ -477,14 +504,14 @@ public class BlockShockwaveScheduler
             // 基础倾斜角度
             float baseTilt = (float) (task.impactForce * 15.0 * falloff);
             // 加少量随机扰动
-            baseTilt *= 0.85F + rng.method_43057() * 0.3F;
+            baseTilt *= 0.85F + (float) detUnit(tiltSeed) * 0.3F;
             if (baseTilt > 60.0F) baseTilt = 60.0F;
 
             // === 根据模式计算倾斜方向 ===
             if ("earthquake".equals(task.shakeMode) || "chaos".equals(task.shakeMode))
             {
                 // 地震/混沌模式：完全随机方向倾斜
-                double angle = rng.method_43058() * Math.PI * 2;
+                double angle = detUnit(tiltSeed ^ 0xE7037ED1A0B428DBL) * Math.PI * 2;
                 // chaos 模式倾斜更大更混乱
                 float chaosMultiplier = "chaos".equals(task.shakeMode) ? 1.5F : 1.0F;
                 tiltX = (float) (Math.cos(angle) * baseTilt * chaosMultiplier);
@@ -509,7 +536,7 @@ public class BlockShockwaveScheduler
                 else
                 {
                     // 在震源中心正上方：随机方向倾斜
-                    double angle = rng.method_43058() * Math.PI * 2;
+                    double angle = detUnit(tiltSeed ^ 0x8EBC6AF09C88C6E3L) * Math.PI * 2;
                     tiltX = (float) (Math.cos(angle) * baseTilt);
                     tiltZ = (float) (Math.sin(angle) * baseTilt);
                 }
@@ -602,7 +629,8 @@ public class BlockShockwaveScheduler
         else if ("chaos".equals(task.shakeMode))
         {
             // chaos 模式间隔随机（2~duration）
-            interval = Math.max(2, task.world.method_8409().method_43048(task.shakeDuration) + 2);
+            interval = Math.max(2, detInt(task.pos.method_10063() ^ ((long) task.currentShakeCount << 32),
+                                          Math.max(1, task.shakeDuration)) + 2);
         }
         task.nextShakeTick = task.currentTick + interval;
     }
@@ -696,8 +724,11 @@ public class BlockShockwaveScheduler
             {
                 // 普通模式：确保方块回到原位
                 ensureBlockAtOriginalPosition(task);
-                task.activeEntityUuid = null;
+                // 必须先 remove 再置 null：ConcurrentHashMap 不允许 null 键，
+                // remove(null) 会抛 NPE 并被 tick() 的 catch 吞掉，
+                // 该映射条目就永久泄漏（表只增不减）。
                 entityToTask.remove(task.activeEntityUuid);
+                task.activeEntityUuid = null;
             }
         }
         else if (entity instanceof class_1540)
@@ -705,7 +736,9 @@ public class BlockShockwaveScheduler
             class_1540 falling = (class_1540) entity;
 
             // 检查是否落地（onGround 或垂直速度接近 0 且 age 较大）
-            boolean onGround = ((EntityAccessor) falling).isOnGround();
+            // bbs$ 前缀：读的是 onGround 字段本身，而不是被 BbsEntityMixin
+            // 改写成恒 false 的 vanilla Entity.isOnGround()
+            boolean onGround = ((EntityAccessor) falling).bbs$isOnGround();
             if (onGround || (falling.field_6012 > 40 && falling.method_18798().field_1351 > -0.01))
             {
                 // 实体已落地
@@ -725,8 +758,9 @@ public class BlockShockwaveScheduler
                     falling.method_31472();
                     ensureBlockAtOriginalPosition(task);
 
-                    task.activeEntityUuid = null;
+                    // 同前：先 remove 再置 null，避免 ConcurrentHashMap.remove(null) 抛 NPE
                     entityToTask.remove(task.activeEntityUuid);
+                    task.activeEntityUuid = null;
                 }
             }
         }
@@ -869,6 +903,52 @@ public class BlockShockwaveScheduler
         }
         tasks.clear();
         entityToTask.clear();
+        scheduledPositions.clear();
+    }
+
+    /**
+     * 释放一个已结束任务占用的去重位
+     */
+    private static void releaseScheduled(ShakeTask task)
+    {
+        java.util.Set<class_2338> scheduled = scheduledPositions.get(task.world);
+
+        if (scheduled != null)
+        {
+            scheduled.remove(task.pos);
+
+            if (scheduled.isEmpty())
+            {
+                scheduledPositions.remove(task.world);
+            }
+        }
+    }
+
+    /* === 确定性伪随机（xorshift64*） ===
+     * 替代 World 的全局随机源，保证同一回放两次播放结果一致；
+     * 无对象分配、无内部状态，种子由方块坐标与震动序号派生。 */
+
+    private static long detMix(long z)
+    {
+        z += 0x9E3779B97F4A7C15L;
+        z = (z ^ (z >>> 30)) * 0xBF58476D1CE4E5B9L;
+        z = (z ^ (z >>> 27)) * 0x94D049BB133111EBL;
+        return z ^ (z >>> 31);
+    }
+
+    private static double detUnit(long seed)
+    {
+        return (detMix(seed) >>> 11) / (double) (1L << 53);
+    }
+
+    private static int detInt(long seed, int bound)
+    {
+        if (bound <= 0)
+        {
+            return 0;
+        }
+
+        return (int) Math.floorMod(detMix(seed), (long) bound);
     }
 
     /**

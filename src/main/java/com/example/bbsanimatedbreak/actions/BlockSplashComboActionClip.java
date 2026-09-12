@@ -9,6 +9,7 @@ import mchorse.bbs_mod.actions.types.ActionClip;
 import mchorse.bbs_mod.film.Film;
 import mchorse.bbs_mod.film.replays.Replay;
 import mchorse.bbs_mod.settings.values.numeric.ValueBoolean;
+import mchorse.bbs_mod.settings.values.numeric.ValueDouble;
 import mchorse.bbs_mod.utils.clips.Clip;
 import net.minecraft.class_1309;
 import net.minecraft.class_2338;
@@ -77,19 +78,55 @@ public class BlockSplashComboActionClip extends ActionClip
     public void applyAction(class_1309 actor, SuperFakePlayer player, Film film, Replay replay, int tick)
     {
         if (!(player.method_37908() instanceof class_3218)) return;
-
-        class_3218 world = (class_3218) player.method_37908();
-
-        /* 检查选区是否有烘焙的方块 */
         if (!this.selection.hasBakedBlocks()) return;
 
         /* 计算相对 tick */
         int relative = tick - this.tick.get();
 
-        /* 计算选区包围盒（用于设置子效果 actionClip 的坐标） */
-        this.calculateSelectionBounds();
+        List<SubEffect> active = new ArrayList<>();
+        this.subEffects.getActiveSubEffects(relative, active);
 
-        /* 遍历命中的子效果 */
+        for (SubEffect sub : active)
+        {
+            /* 仅在子效果的 startTick 触发（frequency=0 模式） */
+            if (relative - sub.startTick.get() != 0) continue;
+
+            ActionClip subClip = this.prepareSubClip(sub);
+
+            if (subClip == null) continue;
+
+            /* 触发子效果（不检查强度，因为 startTick 时强度可能为0但效果需要启动） */
+            subClip.applyAction(actor, player, film, replay, this.tick.get() + sub.startTick.get());
+        }
+    }
+
+    /**
+     * 把回放时钟转发给子片段（BBS 回放规则）
+     *
+     * === 为什么必须转发 ===
+     * BBS 只认识 combo 片段本身，子片段是通过 subClip.applyAction() 直接调用的，
+     * 因此 BBS <b>不会</b>替子片段调用 applyRange。
+     *
+     * 而物理类子效果（block_splash 的 Rapier/Jolt 刚体）的步进正挂在
+     * BlockSplashActionClip#applyRange 上——若不转发，子效果的物理世界会永远停在
+     * localTick = 0，方块僵在半空不动，直到回放停止才被清理。
+     *
+     * 传入的是<b>当前回放绝对 tick</b>：子片段会自行做
+     * {@code tick - subClip.tick} 的换算（subClip.tick 已在 applyAction 时定位到
+     * combo 起点 + 子效果偏移），从而得到正确的局部 tick。
+     *
+     * 注意：这里刻意不做参数准备（选区/强度缩放）。
+     * prepareSubClip 里的强度缩放不是幂等的（会连乘），若每 tick 调用会指数放大力度；
+     * 而且子片段的选区与 tick 在 applyAction 时已经固化，applyRange 只需转发时钟。
+     */
+    @Override
+    public void applyRange(class_1309 actor, SuperFakePlayer player, Film film, Replay replay, int tick)
+    {
+        if (!(player.method_37908() instanceof class_3218)) return;
+        if (!this.selection.hasBakedBlocks()) return;
+
+        int relative = tick - this.tick.get();
+
         List<SubEffect> active = new ArrayList<>();
         this.subEffects.getActiveSubEffects(relative, active);
 
@@ -99,33 +136,46 @@ public class BlockSplashComboActionClip extends ActionClip
 
             if (subClip == null) continue;
 
-            /* 检查是否是子效果的触发 tick（相对 comboClip） */
-            int subRelative = relative - sub.startTick.get();
-
-            /* 仅在子效果的 startTick 触发（frequency=0 模式） */
-            if (subRelative != 0) continue;
-
-            /* 设置子效果 actionClip 的时间 */
-            subClip.tick.set(this.tick.get() + sub.startTick.get());
-            subClip.duration.set(sub.duration.get());
-
-            /* 设置子效果 actionClip 的坐标为选区包围盒 */
-            this.applySelectionBoundsToClip(subClip);
-
-            /* 设置方块过滤器（圆形/三角形等不规则选区精确过滤） */
-            if (subClip instanceof IBlockFilterable filterable)
-            {
-                Set<class_2338> filter = this.selection.getBlockFilterSet();
-                filterable.setBlockFilter(filter);
-            }
-
-            /* 根据强度缩放子效果参数（强度=1时原值，强度<1时减弱） */
-            float strength = sub.getStrengthAt(subRelative);
-            this.applyStrengthToClip(subClip, strength);
-
-            /* 触发子效果（不检查强度，因为 startTick 时强度可能为0但效果需要启动） */
-            subClip.applyAction(actor, player, film, replay, this.tick.get() + sub.startTick.get());
+            subClip.applyRange(actor, player, film, replay, tick);
         }
+    }
+
+    /**
+     * 准备一个子片段：同步时间、坐标、选区过滤器、强度曲线
+     *
+     * @return 可用的子片段；无效时返回 null
+     */
+    private ActionClip prepareSubClip(SubEffect sub)
+    {
+        ActionClip subClip = sub.getActionClip();
+
+        if (subClip == null)
+        {
+            return null;
+        }
+
+        /* 计算选区包围盒（用于设置子效果 actionClip 的坐标） */
+        this.calculateSelectionBounds();
+
+        /* 设置子效果 actionClip 的时间：绝对起始 tick 由 combo 起点 + 子效果偏移决定 */
+        subClip.tick.set(this.tick.get() + sub.startTick.get());
+        subClip.duration.set(sub.duration.get());
+
+        /* 设置子效果 actionClip 的坐标为选区包围盒 */
+        this.applySelectionBoundsToClip(subClip);
+
+        /* 设置方块过滤器（圆形/三角形等不规则选区精确过滤） */
+        if (subClip instanceof IBlockFilterable filterable)
+        {
+            Set<class_2338> filter = this.selection.getBlockFilterSet();
+            filterable.setBlockFilter(filter);
+        }
+
+        /* 根据强度缩放子效果参数（强度=1时原值，强度<1时减弱） */
+        float strength = sub.getStrengthAt(0);
+        this.applyStrengthToClip(subClip, strength);
+
+        return subClip;
     }
 
     /**
@@ -201,6 +251,13 @@ public class BlockSplashComboActionClip extends ActionClip
      * 根据强度缩放子效果的关键参数。
      * strength=1 时保持原值，strength<1 时按比例减弱。
      * 这实现了"丝滑过渡"：子效果A淡出时参数减弱，子效果B淡入时参数增强。
+     *
+     * === 幂等性（重要） ===
+     * 子片段是<b>持久实例</b>（内嵌在 SubEffect 里、随影片存档），而 applyAction
+     * 每次回放/每次拖动时间轴都会被重新触发。若直接 {@code value = value * s}，
+     * 力度就会随触发次数连乘 —— 播放 5 次后飞溅会猛烈到失控。
+     * 因此这里用「基准值缓存」：记住原始值，只在检测到外部修改
+     * （当前值 ≠ 上次写入值，说明用户在 UI 里改过）时才刷新基准。
      */
     private void applyStrengthToClip(ActionClip clip, float strength)
     {
@@ -210,24 +267,50 @@ public class BlockSplashComboActionClip extends ActionClip
         if (clip instanceof BlockSplashActionClip splash)
         {
             /* 飞溅力度按强度缩放 */
-            double origPower = splash.power.get();
-            splash.power.set(origPower * s);
+            this.scaleParam(splash.power, s);
         }
         else if (clip instanceof BlockShockwaveActionClip shockwave)
         {
             /* 振幅和冲击力按强度缩放 */
-            double origAmp = shockwave.amplitude.get();
-            double origForce = shockwave.impactForce.get();
-            shockwave.amplitude.set(origAmp * s);
-            shockwave.impactForce.set(origForce * s);
+            this.scaleParam(shockwave.amplitude, s);
+            this.scaleParam(shockwave.impactForce, s);
         }
         else if (clip instanceof BlockSplashReverseActionClip reverse)
         {
             /* 反向飞溅的散射半径按强度缩放 */
-            double origRadius = reverse.scatterRadius.get();
-            reverse.scatterRadius.set(origRadius * s);
+            this.scaleParam(reverse.scatterRadius, s);
         }
         /* BlockPathActionClip 不缩放（路径速度不应随强度变化） */
+    }
+
+    /** 强度缩放的基准值缓存（以 ValueDouble 实例身份为键，随 combo clip 生命周期存活） */
+    private final java.util.Map<ValueDouble, Double> strengthBase = new java.util.IdentityHashMap<>();
+    private final java.util.Map<ValueDouble, Double> strengthLast = new java.util.IdentityHashMap<>();
+
+    /**
+     * 幂等地把一个参数按强度缩放（见 applyStrengthToClip 的注释）
+     *
+     * @param value 目标参数
+     * @param s     强度（>= 0.05）
+     */
+    private void scaleParam(ValueDouble value, float s)
+    {
+        double current = value.get();
+        Double base = this.strengthBase.get(value);
+        Double last = this.strengthLast.get(value);
+
+        if (base == null || last == null || Math.abs(current - last) > 1.0E-9D)
+        {
+            /* 首次调用，或用户在 UI 里改过值 → 以当前值为新基准 */
+            base = current;
+        }
+
+        double scaled = base * s;
+
+        this.strengthBase.put(value, base);
+        this.strengthLast.put(value, scaled);
+
+        value.set(scaled);
     }
 
     @Override

@@ -240,6 +240,17 @@ public class JoltPhysicsWorld implements PhysicsBackendWorld
     @Override
     public void getBodyTransform(long handle, double[] pos, float[] rot)
     {
+        /* native 安全闸门：close() 之后 PhysicsSystem 已释放，
+         * 任何查询都可能读到垃圾（表现为方块瞬移/抽搐）甚至崩溃。
+         * 这里返回安全默认值（原点 + 单位四元数）。 */
+        if (!this.valid || handle <= 0)
+        {
+            pos[0] = pos[1] = pos[2] = 0D;
+            rot[0] = rot[1] = rot[2] = 0F;
+            rot[3] = 1F;
+            return;
+        }
+
         int bodyId = toBodyId(handle);
 
         /* 原地填充复用对象，避免每实体每 tick 分配 */
@@ -260,6 +271,12 @@ public class JoltPhysicsWorld implements PhysicsBackendWorld
     @Override
     public void getBodyVelocity(long handle, double[] vel)
     {
+        if (!this.valid || handle <= 0)
+        {
+            vel[0] = vel[1] = vel[2] = 0D;
+            return;
+        }
+
         Vec3 velocity = this.bodies.getLinearVelocity(toBodyId(handle));
         vel[0] = velocity.getX();
         vel[1] = velocity.getY();
@@ -269,6 +286,12 @@ public class JoltPhysicsWorld implements PhysicsBackendWorld
     @Override
     public void getBodyAngularVelocity(long handle, float[] angVel)
     {
+        if (!this.valid || handle <= 0)
+        {
+            angVel[0] = angVel[1] = angVel[2] = 0F;
+            return;
+        }
+
         Vec3 velocity = this.bodies.getAngularVelocity(toBodyId(handle));
         angVel[0] = velocity.getX();
         angVel[1] = velocity.getY();
@@ -278,30 +301,55 @@ public class JoltPhysicsWorld implements PhysicsBackendWorld
     @Override
     public boolean isBodySleeping(long handle)
     {
+        if (!this.valid || handle <= 0)
+        {
+            return true;
+        }
+
         return !this.bodies.isActive(toBodyId(handle));
     }
 
     @Override
     public void setBodyVelocity(long handle, double vx, double vy, double vz)
     {
+        if (!this.valid || handle <= 0)
+        {
+            return;
+        }
+
         this.bodies.setLinearVelocity(toBodyId(handle), new Vec3((float) vx, (float) vy, (float) vz));
     }
 
     @Override
     public void setBodyAngularVelocity(long handle, float ax, float ay, float az)
     {
+        if (!this.valid || handle <= 0)
+        {
+            return;
+        }
+
         this.bodies.setAngularVelocity(toBodyId(handle), new Vec3(ax, ay, az));
     }
 
     @Override
     public void applyImpulse(long handle, double ix, double iy, double iz)
     {
+        if (!this.valid || handle <= 0)
+        {
+            return;
+        }
+
         this.bodies.addImpulse(toBodyId(handle), new Vec3((float) ix, (float) iy, (float) iz));
     }
 
     @Override
     public void setBodyDamping(long handle, double linear, double angular)
     {
+        if (!this.valid || handle <= 0)
+        {
+            return;
+        }
+
         Body body = this.dynamicBodies.get(handle);
 
         if (body == null)

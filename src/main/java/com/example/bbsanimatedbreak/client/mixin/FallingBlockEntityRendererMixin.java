@@ -6,6 +6,7 @@ import com.example.bbsanimatedbreak.client.ClientRotationStateManager;
 import com.example.bbsanimatedbreak.client.ClientRotationStateManager.ClientRotationState;
 import org.joml.Quaternionf;
 import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
@@ -42,6 +43,26 @@ import net.minecraft.class_901;
 @Mixin(class_901.class)
 public abstract class FallingBlockEntityRendererMixin
 {
+    /**
+     * 本帧是否由本 Mixin 压入过矩阵栈
+     *
+     * === 为什么需要显式标志位，而不是在 RETURN 处重新问一次 isRotating ===
+     * 原先的写法是"HEAD 判 isRotating 决定 push，RETURN 再判一次决定 pop"。
+     * 两次判定必须严格同值，否则矩阵栈失衡：
+     * - HEAD 为 true、RETURN 为 false → 少一次 pop，栈永久残留一层，
+     *   之后所有实体的渲染都被平移/旋转，整屏画面错乱；
+     * - HEAD 为 false、RETURN 为 true → 多一次 pop，栈下溢，
+     *   后果同样严重且更难定位。
+     *
+     * isRotating() 内部读 DataTracker 且 catch 后返回 false，
+     * 两次调用并非必然同值（异常路径、外部修改等）。
+     * 用标志位记录"我确实 push 了"，可让 pop 与 push 严格一一对应。
+     *
+     * @Unique 保证该字段只存在于本 Mixin，不会与目标类或其它 Mixin 冲突。
+     */
+    @Unique
+    private boolean bbs$pushedMatrix = false;
+
     /**
      * 在 render 方法开始时注入，应用旋转和挤压变形
      */
@@ -150,6 +171,8 @@ public abstract class FallingBlockEntityRendererMixin
 
         // === 围绕方块几何中心 (0, 0.5, 0) 旋转 ===
         matrices.method_22903();
+        // push 成功即立刻登记，保证 RETURN 处的 pop 与它严格一一对应
+        this.bbs$pushedMatrix = true;
         matrices.method_22904(0.0, 0.5, 0.0);
 
         // === 非实体化模式：非线性缩小消失动画 ===
@@ -202,6 +225,9 @@ public abstract class FallingBlockEntityRendererMixin
         ));
 
         matrices.method_22904(0.0, -0.5, 0.0);
+
+        // 注意：不在此处置位标志——push 时已置位，若中途抛异常导致 RETURN 未执行，
+        // 标志保持 true 会让"未 push 就 pop"的情况不会发生（宁少 pop 不多 pop）。
     }
 
     /**
@@ -217,8 +243,10 @@ public abstract class FallingBlockEntityRendererMixin
         int light,
         CallbackInfo ci)
     {
-        if (RotatingFallingBlockManager.isRotating(entity))
+        // 只 pop 自己 push 过的那一层（不再重复问 isRotating，避免栈失衡）
+        if (this.bbs$pushedMatrix)
         {
+            this.bbs$pushedMatrix = false;
             matrices.method_22909();
         }
     }

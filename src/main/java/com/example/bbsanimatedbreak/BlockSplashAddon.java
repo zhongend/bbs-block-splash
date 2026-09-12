@@ -81,6 +81,12 @@ public class BlockSplashAddon implements ModInitializer, BBSAddonMod
             BlockSplashReverseScheduler.clearAll();
             // 清理非实体化方块动画调度器（移除所有未消失的动画方块）
             BlockSplashAnimationScheduler.clearAll();
+            // 清理路径运动调度器（discard 所有路径实体并解除旋转物理状态）
+            // 旧实现从未被调用 → static tasks 长期强引用 ServerWorld 与实体
+            BlockPathScheduler.clearAll();
+            // 清理原版旋转物理状态表（static，按实体 UUID 索引）
+            // 旧实现从未被调用 → 状态跨世界/跨存档累积，造成内存泄漏
+            RotatingFallingBlockManager.clearAll();
             // 销毁所有原生物理世界（释放 native 内存 + 连带清理 PhysicsRecording）
             // 必须在 BlockSplashRecoveryManager.restoreAll 之前调用，
             // 因为 clearAll 不清理 Recovery 记录，restoreAll 仍能找到记录恢复方块
@@ -99,8 +105,12 @@ public class BlockSplashAddon implements ModInitializer, BBSAddonMod
             BlockSplashReverseScheduler.tick();
             BlockPathScheduler.tick();
             BlockSplashAnimationScheduler.tick();
-            // 步进所有原生物理世界（Rapier3d pipeline）
-            PhysicsWorldRegistry.tickAll(1.0 / 20.0);
+            // 物理世界维护（只做失效/空世界/超时清理，**不推进物理**）
+            //
+            // 物理步进已改由 BBS 回放时钟驱动（见 BlockSplashActionClip#applyRange）。
+            // 这样暂停回放时物理会一起定格、拖动时间轴时物理与时间轴一致、
+            // 导出视频时可复现 —— 这是回放工具必须遵守的规则。
+            PhysicsWorldRegistry.maintenance();
         });
     }
 

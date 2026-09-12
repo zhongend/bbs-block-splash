@@ -289,17 +289,32 @@ public class BlockSplashActionClip extends ActionClip implements IBlockFilterabl
             int maxBlocks = this.maxPhysicsBlocks.get();
             int collRadius = this.collisionRadius.get();
 
-            // 1. 创建物理世界（自定义重力，按 engine 选择 Rapier / Jolt 后端）
-            // 同时传入 recordingId 和 dimensionKey，让 PhysicsWorldRegistry 在
-            // 销毁世界时连带清理 PhysicsRecording 和 BlockSplashRecoveryManager 记录，
-            // 修复"回放次数越多越卡"的资源泄漏。
-            UUID worldId = UUID.randomUUID();
-            PhysicsBackendWorld physicsWorld = PhysicsWorldRegistry.createWorld(
-                worldId, gx, gy, gz,
+            // === 0. 派生确定性 worldKey，并做幂等判定 ===
+            //
+            // BBS 的 ActionPlayer#goTo 在拖动时间轴时会「逐 tick 重放」
+            // 所有 ActionClip（while 循环里反复调用 applyAction）。
+            // 如果 applyAction 不是幂等的，同一位置会被反复生成刚体与实体
+            // → 数百个方块重叠在一起互相挤压 → 激烈的随机抽搐。
+            //
+            // 因此 worldKey 由「影片 + 回放 + 片段起始 tick + 区域」派生：
+            // 同一个片段的同一次触发永远映射到同一个世界，
+            // 已经建立过就直接返回。
+            String worldKey = this.physicsWorldKey(film, replay);
+
+            if (PhysicsWorldRegistry.has(worldKey))
+            {
+                return;
+            }
+
+            // 1. 创建回放物理世界（自定义重力，按 engine 选择 Rapier / Jolt 后端）
+            PhysicsWorldRegistry.Entry entry = PhysicsWorldRegistry.begin(
+                worldKey, gx, gy, gz,
                 recordingId,
                 world.method_27983(),
                 engine
             );
+
+            PhysicsBackendWorld physicsWorld = entry.world;
 
             // 2. 密度优化：大区域抽样，最多 maxBlocks 个动态方块
             List<class_2338> sampledBlocks = this.sampleBlocksForDensity(blocks, maxBlocks);
@@ -390,14 +405,9 @@ public class BlockSplashActionClip extends ActionClip implements IBlockFilterabl
                     PhysicsBlockEntity physics = new PhysicsBlockEntity(
                         world, pos.method_10263() + 0.5, pos.method_10264(), pos.method_10260() + 0.5, state
                     );
-                    physics.setBodyHandle(bodyHandle, physicsWorld, worldId);
+                    physics.setBodyHandle(bodyHandle, physicsWorld, entry.worldId);
+                    physics.setWorldKey(worldKey);
                     physics.setInitialVelocity(velocity[0], velocity[1], velocity[2]);
-
-                    // 同步客户端物理预测参数（让客户端 165Hz 渲染时用相同的重力/阻尼/角速度预测）
-                    physics.setClientPhysicsParams(
-                        (float) gy, (float) linDamp, (float) angDamp,
-                        angVx, angVy, angVz
-                    );
 
                     // 关联记录系统
                     if (recordingId != null)
@@ -412,6 +422,19 @@ public class BlockSplashActionClip extends ActionClip implements IBlockFilterabl
                     world.method_8649(physics);
                     BlockSplashRecoveryManager.recordEntity(world, physics);
 
+                    // 保存初始条件：向后拖动时间轴时物理不可"倒算"，
+                    // 需要据此重建刚体并重新模拟到目标 tick（结果确定性一致）
+                    entry.bodies.add(new PhysicsWorldRegistry.BodyBinding(
+                        physics,
+                        pos.method_10263() + 0.5,
+                        pos.method_10264() + 0.5,
+                        pos.method_10260() + 0.5,
+                        1.0f, 0.8f, 0.1f,
+                        linDamp, angDamp,
+                        velocity[0] * 20.0, velocity[1] * 20.0, velocity[2] * 20.0,
+                        angVx, angVy, angVz
+                    ));
+
                     blockIndex++;
                 }
                 catch (Exception e)
@@ -421,6 +444,13 @@ public class BlockSplashActionClip extends ActionClip implements IBlockFilterabl
                     blockIndex++;
                 }
             }
+
+            // 存活上限（以回放时钟计，暂停时不计寿命——这是"回放规则"的一部分）：
+            // - solidify=true：方块落地后长期留在地上堆成山 → 直到回放停止才清理
+            // - solidify=false：到 animationDuration 后整体消失（与原版路径行为对齐）
+            entry.lifeTicks = doSolidify
+                ? 0
+                : Math.max(200, (int) (animDurationSec * 20.0) + 200);
         }
         else
         {
@@ -508,6 +538,62 @@ public class BlockSplashActionClip extends ActionClip implements IBlockFilterabl
     }
 
     /**
+     * 派生本片段物理世界的确定性键
+     *
+     * 「影片 + 回放 + 片段起始 tick + 区域」→ 同一片段的同一次触发永远映射到同一个世界。
+     * 带上区域是为了区分组合片段里「同一起始 tick 但作用区域不同」的多个子效果。
+     *
+     * 该键必须在 applyAction 与 applyRange 中保持一致，否则物理会被查到另一个世界。
+     */
+    public String physicsWorldKey(Film film, Replay replay)
+    {
+        String filmId = (film == null) ? null : film.getId();
+        String replayId = (replay != null) ? replay.getId() : null;
+
+        String regionTag = this.x.get() + "," + this.y.get() + "," + this.z.get()
+            + ":" + this.x2.get() + "," + this.y2.get() + "," + this.z2.get();
+
+        return PhysicsWorldRegistry.keyOf(filmId, replayId, this.tick.get(), regionTag);
+    }
+
+    /**
+     * 回放时钟驱动的物理步进（BBS 回放规则的核心）
+     *
+     * BBS 的 ActionClip 有两个回调：
+     * - {@code applyAction}：只在片段起始 tick（或 frequency 命中时）触发一次
+     * - {@code applyRange} ：在「片段覆盖的每一个 tick」都触发
+     *
+     * BBS 的时钟语义保证了 applyRange 只在回放 tick 真正推进时被调用：
+     * - 暂停回放（ActionPlayer.playing=false）→ tick() 提前返回 → 不调用
+     * - 播放 → 每 tick 调用一次
+     * - 拖动时间轴（goTo）→ 逐 tick 调用，与拖动方向一致
+     *
+     * 因此把物理步进挂在这里，物理时间就与回放时间严格锁死：
+     * 暂停即定格（可以拍定格镜头），拖动即跟随，导出即复现。
+     *
+     * 旧实现把物理挂在 ServerTickEvents.END_SERVER_TICK 上，
+     * 暂停回放时方块仍在继续下落，无法作为拍摄工具使用。
+     */
+    @Override
+    public void applyRange(class_1309 actor, SuperFakePlayer fakePlayer, Film film, Replay replay, int tick)
+    {
+        if (fakePlayer == null)
+        {
+            return;
+        }
+
+        String worldKey = this.physicsWorldKey(film, replay);
+
+        // 原版下落路径没有物理世界，此处自然短路
+        if (!PhysicsWorldRegistry.has(worldKey))
+        {
+            return;
+        }
+
+        PhysicsWorldRegistry.driveTo(worldKey, tick - this.tick.get());
+    }
+
+    /**
      * 解析物理引擎选择
      *
      * engine 键为空（旧存档，没有这个键）时跟随 sableEnabled 布尔，
@@ -572,46 +658,148 @@ public class BlockSplashActionClip extends ActionClip implements IBlockFilterabl
     }
 
     /**
-     * 注入静态碰撞体：飞溅区域周围 radius 格内的非空气方块作为地面/墙壁
+     * 注入静态碰撞体（地面 / 侧墙）
+     *
+     * === 第一性原理 ===
+     * 刚体只在「真正有实体挡住它」的方向才需要静态碰撞体。
+     * 对一个被清空的长方体区域来说，起作用的只有两类几何：
+     *   ① 每个方块柱下方的第一块实心方块（地板）
+     *   ② 区域外壳向外遇到的第一块实心方块（墙）
+     *
+     * === 旧实现的三个 bug ===
+     * 1. 用「每个飞溅方块 × 半径 8 的立方体」遍历，是 O(N·r³)——300 方块要遍历
+     *    147 万次，且真正有用的地板/墙被淹没在无意义的内部遍历里；
+     * 2. 达到 2000 上限时直接 {@code return}（而非 continue），导致<b>排在后面的
+     *    方块完全没有地面</b> → 它们直接穿过地面坠入虚空 → 在极低 Y 处来回弹跳，
+     *    表现就是"方块不受物理控制地抽搐"；
+     * 3. 上限 2000 对一个边长 8 的立方壳而言远远不够。
+     *
+     * === 新实现 ===
+     * 只注入「承力几何」，注入量与环境表面面积同阶而不是与体积同阶，
+     * 因此上限 4000 足以覆盖大规模场景，且达到上限时不再中断整体流程。
      *
      * @param world        Minecraft 世界
-     * @param physicsWorld 原生物理世界
-     * @param splashBlocks 飞溅方块列表（这些方块会被设为空气，不注入）
-     * @param radius       注入范围（格）
+     * @param physicsWorld 刚体物理世界
+     * @param splashBlocks 被清空的飞溅方块列表（这些位置不注入）
+     * @param radius       向下 / 向外搜索距离（格）
      */
     private void injectStaticCollisionBlocks(class_3218 world, PhysicsBackendWorld physicsWorld,
                                               List<class_2338> splashBlocks, int radius)
     {
+        if (splashBlocks.isEmpty())
+        {
+            return;
+        }
+
         Set<class_2338> splashSet = new HashSet<>(splashBlocks);
         Set<class_2338> injected = new HashSet<>();
-        int maxStatic = 2000; // 性能保护：最多 2000 个静态碰撞体（动态地面检测会补加）
+        int maxStatic = 4000;
+
+        // === ① 地板：每个飞溅方块所在柱向下找到第一块实心方块 ===
+        for (class_2338 splashPos : splashBlocks)
+        {
+            int x = splashPos.method_10263();
+            int z = splashPos.method_10260();
+
+            for (int d = 1; d <= radius; d++)
+            {
+                class_2338 pos = new class_2338(x, splashPos.method_10264() - d, z);
+
+                if (splashSet.contains(pos))
+                {
+                    continue;
+                }
+
+                if (isSolid(world, pos))
+                {
+                    injectStatic(physicsWorld, injected, pos, maxStatic);
+
+                    // 再往下一格：薄地板（单层）更稳，避免高速冲击"顶穿"
+                    class_2338 below = new class_2338(x, pos.method_10264() - 1, z);
+                    if (!splashSet.contains(below) && isSolid(world, below))
+                    {
+                        injectStatic(physicsWorld, injected, below, maxStatic);
+                    }
+
+                    break;
+                }
+            }
+        }
+
+        // === ② 侧墙：只沿区域外壳向外搜索 ===
+        int minX = Integer.MAX_VALUE, maxX = Integer.MIN_VALUE;
+        int minZ = Integer.MAX_VALUE, maxZ = Integer.MIN_VALUE;
+
+        for (class_2338 pos : splashBlocks)
+        {
+            minX = Math.min(minX, pos.method_10263());
+            maxX = Math.max(maxX, pos.method_10263());
+            minZ = Math.min(minZ, pos.method_10260());
+            maxZ = Math.max(maxZ, pos.method_10260());
+        }
 
         for (class_2338 splashPos : splashBlocks)
         {
-            for (int dx = -radius; dx <= radius; dx++)
+            int x = splashPos.method_10263();
+            int z = splashPos.method_10260();
+
+            if (x != minX && x != maxX && z != minZ && z != maxZ)
             {
-                for (int dy = -radius; dy <= radius; dy++)
+                // 内部方块的地板已由步骤 ① 覆盖，无需再向外搜索
+                continue;
+            }
+
+            for (int dir = 0; dir < 4; dir++)
+            {
+                int dx = (dir == 0) ? -1 : (dir == 1) ? 1 : 0;
+                int dz = (dir == 2) ? -1 : (dir == 3) ? 1 : 0;
+
+                for (int d = 1; d <= radius; d++)
                 {
-                    for (int dz = -radius; dz <= radius; dz++)
+                    class_2338 pos = new class_2338(
+                        x + dx * d, splashPos.method_10264(), z + dz * d);
+
+                    if (splashSet.contains(pos))
                     {
-                        if (injected.size() >= maxStatic) return;
+                        continue;
+                    }
 
-                        class_2338 pos = splashPos.method_10069(dx, dy, dz);
-
-                        // 跳过飞溅方块本身（它们会被设为空气）
-                        if (splashSet.contains(pos)) continue;
-                        // 跳过已注入的
-                        if (injected.contains(pos)) continue;
-
-                        class_2680 state = world.method_8320(pos);
-                        if (!state.method_26215() && state.method_26204().method_36555() >= 0)
-                        {
-                            physicsWorld.addStaticBlock(pos.method_10263(), pos.method_10264(), pos.method_10260());
-                            injected.add(pos);
-                        }
+                    if (isSolid(world, pos))
+                    {
+                        injectStatic(physicsWorld, injected, pos, maxStatic);
+                        break;
                     }
                 }
             }
+        }
+    }
+
+    /** 方块是否参与碰撞（非空气且非无碰撞方块） */
+    private static boolean isSolid(class_3218 world, class_2338 pos)
+    {
+        try
+        {
+            class_2680 state = world.method_8320(pos);
+            return !state.method_26215() && state.method_26204().method_36555() >= 0;
+        }
+        catch (Exception e)
+        {
+            return false;
+        }
+    }
+
+    /** 注入一个静态碰撞体（去重 + 上限保护；达到上限只是跳过，不中断整体流程） */
+    private static void injectStatic(PhysicsBackendWorld physicsWorld, Set<class_2338> injected,
+                                     class_2338 pos, int maxStatic)
+    {
+        if (injected.size() >= maxStatic)
+        {
+            return;
+        }
+
+        if (injected.add(pos))
+        {
+            physicsWorld.addStaticBlock(pos.method_10263(), pos.method_10264(), pos.method_10260());
         }
     }
 

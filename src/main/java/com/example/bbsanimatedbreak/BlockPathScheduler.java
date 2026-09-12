@@ -46,6 +46,11 @@ public class BlockPathScheduler
         boolean smoothRotationStop, double rotationStopDistance, int rotationResetDuration
     )
     {
+        if (world == null || falling == null || pathPoints == null || pathPoints.size() < 2)
+        {
+            return;
+        }
+
         PathTask task = new PathTask();
         task.world = world;
         task.entityUuid = falling.method_5667();
@@ -160,6 +165,14 @@ public class BlockPathScheduler
 
         task.currentTick++;
 
+        // 兜底超时：speed <= 0 等异常参数下 currentDistance 不增长、t 恒为 0，
+        // 任务与实体将永久滞留（实体也永不 discard）。
+        if (task.currentTick > MAX_TASK_TICKS)
+        {
+            finishTask(task);
+            return;
+        }
+
         /* === 计算方块在曲线上的进度 ===
          *
          * concentration = 1（集中）：贪吃蛇效果，方块紧挨着排队沿曲线前进
@@ -168,9 +181,18 @@ public class BlockPathScheduler
         double queueOffset = task.queueOffset;
         double totalDistance = task.currentDistance + queueOffset;
         double t = 0;
+
         if (task.curveLength > 0)
         {
             t = totalDistance / task.curveLength;
+        }
+        else
+        {
+            // 退化曲线（所有路径点重合 → curveLength = 0）：t 恒为 0，
+            // 永远进不了 t >= 1.0 分支 → 任务与实体永久滞留。
+            // 路径长度为 0 等价于"已到达终点"，直接结束。
+            finishTask(task);
+            return;
         }
 
         if (t >= 1.0)
@@ -364,12 +386,36 @@ public class BlockPathScheduler
      */
     public static void clearAll()
     {
+        // 必须同时 discard 实体并解除旋转物理状态：
+        // tasks 是 static，PathTask 强引用 ServerWorld 与实体，
+        // 只 clear() 列表会让实体留在世界里（继续下落/变方块），
+        // 并阻止世界对象被回收。
+        for (PathTask task : tasks)
+        {
+            try
+            {
+                if (task.entity != null && !task.entity.method_31481())
+                {
+                    task.entity.method_31472();
+                }
+
+                RotatingFallingBlockManager.removePhysics(task.entityUuid);
+            }
+            catch (Exception e)
+            {
+                /* 忽略单个实体清理失败 */
+            }
+        }
+
         tasks.clear();
     }
 
     /**
      * 路径运动任务
      */
+    /** 单任务兜底存活上限（tick）—— 1 小时，仅用于防"永不结束"的任务泄漏 */
+    private static final int MAX_TASK_TICKS = 72000;
+
     public static class PathTask
     {
         public class_3218 world;

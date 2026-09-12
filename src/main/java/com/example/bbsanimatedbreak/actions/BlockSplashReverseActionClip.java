@@ -274,7 +274,12 @@ public class BlockSplashReverseActionClip extends ActionClip implements IBlockFi
                 break;
 
             case "random":
-                blocks.sort(Comparator.comparingInt(rb -> random.nextInt()));
+                // 必须整体洗牌，不能写 Comparator.comparingInt(rb -> random.nextInt())：
+                // 那种写法在每次两两比较时重新取随机数，同一元素的 key 不固定，
+                // 违反排序契约（传递性），元素数 > 32 时 TimSort 会抛
+                // IllegalArgumentException 直接中断 applyAction。
+                // Collections.shuffle 传入固定种子的 Random，结果确定可复现。
+                java.util.Collections.shuffle(blocks, random);
                 break;
 
             case "near_to_far":

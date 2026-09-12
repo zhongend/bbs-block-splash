@@ -1,7 +1,8 @@
 package com.example.bbsanimatedbreak.actions.physics;
 
-import com.example.bbsanimatedbreak.BlockSplashRecoveryManager;
+import java.util.ArrayList;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -9,296 +10,569 @@ import net.minecraft.class_1937;
 import net.minecraft.class_5321;
 
 /**
- * 物理世界注册表（集中步进）
+ * 物理世界注册表（按 BBS 回放时钟驱动）
  *
- * 物理引擎的 pipeline.step() 必须每 tick 对每个世界调用一次，
- * 而非每实体调用一次。本注册表在服务器 tick 事件中遍历所有活跃世界，
- * 各调用一次 stepTick()，确保物理时间正确推进。
+ * ==================================================================
+ * 第一性原理：物理为什么必须由回放时钟驱动
+ * ==================================================================
+ * 旧实现把物理步进挂在 {@code ServerTickEvents.END_SERVER_TICK} 上，
+ * 这违反 BBS 的回放规则：
  *
- * 支持两种后端（见 PhysicsBackendWorld）：
- * - "sable"：Rapier3d 原生（NativePhysicsWorld）
- * - "jolt" ：Jolt Physics（JoltPhysicsWorld，与 bbs-physics-engine 同源引擎）
- * 两种后端的生命周期完全一致，由本注册表统一管理。
+ *   - BBS 暂停回放（ActionPlayer.playing=false）时不再推进 tick，
+ *     但真实服务端 tick 仍在跑 → 暂停时方块继续下落，无法定格拍摄；
+ *   - 拖动时间轴（ActionPlayer.goTo 会逐 tick 重放 clip）时，
+ *     物理已经跑到了别处，画面与时间轴不对应；
+ *   - 导出视频（离线按固定帧率渲染）与实时物理脱钩 → 结果不可复现。
  *
- * 生命周期：
- * - BlockSplashActionClip.applyAction() 调用 createWorld() 创建世界
- * - 服务器 tick 事件调用 tickAll() 步进所有世界
- * - 空世界（动态刚体归零，即所有方块已 discard）立即销毁
- * - 超时（MAX_WORLD_LIFE tick）或 clearAll() 时销毁世界
- * - PhysicsBlockEntity.remove() 只移除自己的刚体，不销毁世界
+ * BBS 已经提供了正确的时钟挂载点：
  *
- * === 资源连带清理（修复"回放次数越多越卡"） ===
- * 销毁世界时连带清理：
- * - PhysicsRecordingManager.clearRecording(recordingId)：清除该回放的物理记录
- *   （300 方块 × 1200 tick = 36 万条/回放 ≈ 43MB，不清会持续累积导致 GC 风暴）
- * - BlockSplashRecoveryManager.clearWorld(dimensionKey)：清除该世界的飞溅恢复记录
- *   （blocks/entityUuids 只增不减，不清会随回放次数累积）
- * 这些清理只在世界销毁时触发，与物理模拟完全解耦，物理质量零损失。
+ *   ActionClip#applyRange(actor, player, film, replay, tick)
+ *
+ * 它在「clip 覆盖的每一个 tick」被调用，且只在回放时钟真正推进时调用
+ * （暂停不调用，播放调用，goTo 逐 tick 拖动也调用）。因此：
+ *
+ *   物理世界推进次数 = 回放 tick 推进次数
+ *
+ * 这是本插件唯一正确的驱动方式。
+ *
+ * ==================================================================
+ * 幂等与确定性
+ * ==================================================================
+ * worldKey 由「filmId + replayId + clipStartTick」派生，因此：
+ *   - 同一个 clip 被重复触发（goTo 来回拖动）不会重复生成刚体与实体；
+ *   - 回放重新开始（DamageControl 已恢复方块）时旧世界已随 stop 销毁，
+ *     于是重建一个新的，行为与首次播放逐帧一致。
+ *
+ * 物理本身不可逆（回放倒放无法"倒着算"），所以向后拖动时采用
+ * 「记录初始条件 → 重建刚体 → 重新模拟到目标 tick」的方式。
+ * 由于固定步长 + 固定种子 + 单线程求解器，重放结果与首次一致。
+ * 每 tick 的重建步数有预算上限，防止长时间倒拖卡住服务器。
+ *
+ * ==================================================================
+ * 生命周期
+ * ==================================================================
+ * 创建：BlockSplashActionClip#applyAction（回放到达 clip 起点）
+ * 步进：BlockSplashActionClip#applyRange（回放 tick 推进）
+ * 销毁：回放停止（BlockSplashReplayHook） / 空世界 / 超时 / 服务器停止
  */
-public class PhysicsWorldRegistry
+public final class PhysicsWorldRegistry
 {
-    /** 世界最大存活 tick（60 秒 = 1200 tick），作为兜底超时 */
-    private static final int MAX_WORLD_LIFE = 1200;
+    /** 单次 driveTo 最多允许的模拟步数（防止长时间倒拖阻塞服务器） */
+    private static final int MAX_STEPS_PER_DRIVE = 60;
 
-    /** 活跃物理世界：worldId → 世界实例（Rapier / Jolt 两种后端统一管理） */
-    private static final ConcurrentHashMap<UUID, PhysicsBackendWorld> worlds = new ConcurrentHashMap<>();
-
-    /** 世界创建时的 tick 计数（用于超时销毁） */
-    private static final ConcurrentHashMap<UUID, Integer> worldAges = new ConcurrentHashMap<>();
-
-    /** worldId → recordingId 映射（销毁世界时连带清理 PhysicsRecording） */
-    private static final ConcurrentHashMap<UUID, UUID> worldRecordingMap = new ConcurrentHashMap<>();
-
-    /** worldId → 世界维度 key 映射（销毁世界时连带清理 BlockSplashRecoveryManager） */
-    private static final ConcurrentHashMap<UUID, class_5321<class_1937>> worldDimensionMap = new ConcurrentHashMap<>();
+    /** 绝对超时上限（tick），仅作为资源泄漏兜底，正常由回放停止清理 */
+    private static final int MAX_WORLD_LIFE = 72000; // 1 小时
 
     /**
-     * 创建并注册一个原生物理世界（默认重力 -11.0 m/s²）
+     * 一条「初始条件 ←→ 实体」的绑定
+     *
+     * 保留初始条件是为了向后拖动时能够重建刚体并重新模拟到目标 tick。
      */
-    public static NativePhysicsWorld createWorld(UUID id)
+    public static final class BodyBinding
     {
-        return createWorld(id, 0.0, -11.0, 0.0);
+        public final PhysicsBlockEntity entity;
+
+        /* 初始条件（全部为物理世界单位） */
+        public final double x, y, z;
+        public final float mass, friction, restitution;
+        public final double linearDamping, angularDamping;
+        public final double vx, vy, vz;      // m/s
+        public final float avx, avy, avz;    // rad/s
+
+        public long handle;
+
+        public BodyBinding(PhysicsBlockEntity entity,
+                           double x, double y, double z,
+                           float mass, float friction, float restitution,
+                           double linearDamping, double angularDamping,
+                           double vx, double vy, double vz,
+                           float avx, float avy, float avz)
+        {
+            this.entity = entity;
+            this.x = x; this.y = y; this.z = z;
+            this.mass = mass; this.friction = friction; this.restitution = restitution;
+            this.linearDamping = linearDamping; this.angularDamping = angularDamping;
+            this.vx = vx; this.vy = vy; this.vz = vz;
+            this.avx = avx; this.avy = avy; this.avz = avz;
+        }
+    }
+
+    /** 一个回放物理世界 */
+    public static final class Entry
+    {
+        public final String key;
+        public final UUID worldId;
+        public final PhysicsBackendWorld world;
+        public final double gx, gy, gz;
+        public final UUID recordingId;
+        public final class_5321<class_1937> dimensionKey;
+
+        /** 已模拟到的局部 tick（相对 clip 起点） */
+        public int simulatedTick = 0;
+
+        /** 存活上限（局部 tick；0 = 直到回放停止） */
+        public int lifeTicks = 0;
+
+        public final List<BodyBinding> bodies = new ArrayList<>();
+        public boolean destroyed = false;
+
+        Entry(String key, UUID worldId, PhysicsBackendWorld world,
+              double gx, double gy, double gz, UUID recordingId,
+              class_5321<class_1937> dimensionKey)
+        {
+            this.key = key;
+            this.worldId = worldId;
+            this.world = world;
+            this.gx = gx; this.gy = gy; this.gz = gz;
+            this.recordingId = recordingId;
+            this.dimensionKey = dimensionKey;
+        }
+
+        public int getBodyCount()
+        {
+            return this.bodies.size();
+        }
+    }
+
+    private static final ConcurrentHashMap<String, Entry> entries = new ConcurrentHashMap<>();
+
+    private PhysicsWorldRegistry() {}
+
+    /* ================================================================
+     * 键
+     * ================================================================ */
+
+    /**
+     * 派生确定性 worldKey
+     *
+     * 同一个 film + replay + clip 起点 tick 永远得到同一个 key，
+     * 这是 applyAction 幂等（拖动时间轴不重复生成）的基础。
+     */
+    public static String keyOf(String filmId, String replayId, int clipStartTick)
+    {
+        return keyOf(filmId, replayId, clipStartTick, null);
     }
 
     /**
-     * 创建并注册一个原生物理世界（自定义重力）
+     * 派生确定性 worldKey（带区域标签）
      *
-     * @param id 唯一标识
-     * @param gx 重力 X 分量（m/s²）
-     * @param gy 重力 Y 分量（m/s²，向下为负）
-     * @param gz 重力 Z 分量（m/s²）
-     * @return 创建的 NativePhysicsWorld 实例
+     * regionTag 用于区分「同一起始 tick 但作用区域不同」的多个片段
+     * （组合片段的多个子效果可能同时启动）。
      */
-    public static NativePhysicsWorld createWorld(UUID id, double gx, double gy, double gz)
+    public static String keyOf(String filmId, String replayId, int clipStartTick, String regionTag)
     {
-        NativePhysicsWorld world = new NativePhysicsWorld(gx, gy, gz);
-        worlds.put(id, world);
-        worldAges.put(id, 0);
-        return world;
+        String f = filmId == null ? "?" : filmId;
+        String r = replayId == null ? "?" : replayId;
+        return f + "@" + r + "#" + clipStartTick + "!" + (regionTag == null ? "" : regionTag);
     }
 
-    /**
-     * 创建并注册原生物理世界，并关联 recordingId 和 dimensionKey 用于连带清理
-     *
-     * @param id            worldId
-     * @param gx, gy, gz    重力分量
-     * @param recordingId   该回放的物理记录 ID（可为 null）
-     * @param dimensionKey  该回放所在维度的 RegistryKey（可为 null）
-     */
-    public static NativePhysicsWorld createWorld(UUID id, double gx, double gy, double gz,
-                                                 UUID recordingId, class_5321<class_1937> dimensionKey)
+    /** 该回放物理世界的 recordingId（按 replayId 派生，确定性） */
+    public static UUID recordingIdOf(String replayId)
     {
-        NativePhysicsWorld world = createWorld(id, gx, gy, gz);
-        if (recordingId != null)
-        {
-            worldRecordingMap.put(id, recordingId);
-        }
-        if (dimensionKey != null)
-        {
-            worldDimensionMap.put(id, dimensionKey);
-        }
-        return world;
+        if (replayId == null) return null;
+        return UUID.nameUUIDFromBytes(replayId.getBytes(java.nio.charset.StandardCharsets.UTF_8));
     }
 
-    /**
-     * 查询已注册的世界
-     */
-    public static PhysicsBackendWorld getWorld(UUID id)
-    {
-        return worlds.get(id);
-    }
+    /* ================================================================
+     * 创建 / 查询
+     * ================================================================ */
 
     /**
-     * 创建并注册物理世界（按引擎选择 Rapier / Jolt 后端），并关联 recordingId 和 dimensionKey
+     * 创建（或复用）一个回放物理世界
      *
-     * @param engine "sable"=Rapier 原生（默认），"jolt"=BBS 物理引擎（Jolt）
+     * @param key       由 {@link #keyOf} 派生的确定性键
+     * @param engine    "sable"（Rapier 原生）/ "jolt"（BBS 物理引擎）
+     * @return 已存在则返回原 Entry（幂等），否则新建
      */
-    public static PhysicsBackendWorld createWorld(UUID id, double gx, double gy, double gz,
-                                                  UUID recordingId, class_5321<class_1937> dimensionKey,
-                                                  String engine)
+    public static Entry begin(String key, double gx, double gy, double gz,
+                              UUID recordingId, class_5321<class_1937> dimensionKey,
+                              String engine)
     {
-        PhysicsBackendWorld world;
+        Entry existing = entries.get(key);
 
-        if ("jolt".equals(engine))
+        if (existing != null)
         {
-            world = new JoltPhysicsWorld(gx, gy, gz);
-        }
-        else
-        {
-            world = new NativePhysicsWorld(gx, gy, gz);
-        }
-
-        worlds.put(id, world);
-        worldAges.put(id, 0);
-
-        if (recordingId != null)
-        {
-            worldRecordingMap.put(id, recordingId);
-        }
-        if (dimensionKey != null)
-        {
-            worldDimensionMap.put(id, dimensionKey);
-        }
-        return world;
-    }
-
-    /**
-     * 物理子步进策略已移入各后端实现（NativePhysicsWorld 2 子步 / JoltPhysicsWorld 3 子步），
-     * 本注册表只负责统一的每 tick 驱动与生命周期管理。
-     */
-
-    /**
-     * 步进所有活跃世界（由服务器 tick 事件调用）
-     *
-     * 每个世界调用一次 stepTick()，由后端自行完成内部子步进。
-     *
-     * @param dt 时间步长（秒），保留参数以兼容旧调用方，子步细节由后端处理
-     */
-    public static void tickAll(double dt)
-    {
-        Iterator<Map.Entry<UUID, PhysicsBackendWorld>> it = worlds.entrySet().iterator();
-        while (it.hasNext())
-        {
-            Map.Entry<UUID, PhysicsBackendWorld> e = it.next();
-            UUID id = e.getKey();
-            PhysicsBackendWorld world = e.getValue();
-
-            // 世界已失效，移除
-            if (!world.isValid())
+            if (!existing.destroyed && existing.world.isValid())
             {
-                it.remove();
-                worldAges.remove(id);
-                cleanupAssociated(id);
-                continue;
+                return existing;
             }
 
-            // === 空世界自动销毁（核心防泄漏逻辑） ===
-            // getBodyCount() 只数动态刚体（不含静态 Fixed 碰撞体）。
-            // 当所有方块被 discard → removeBody 后，动态刚体归零，世界 step()
-            // 是纯浪费（无刚体可推进），且会随回放次数累积导致"越播越卡"。
-            // 检测到空世界立即销毁并连带清理 recording/recovery 记录。
-            //
-            // 时序安全：刚体创建在 applyAction（同步 tick），step 在 END_SERVER_TICK，
-            // 同一 tick 内创建的方块刚体数 > 0，不会被误清。
+            // 已失效的旧世界：先完整销毁（含实体清理），避免 native 泄漏与
+            // 遗留实体持有已释放的 worldPtr
+            destroy(key);
+        }
+
+        PhysicsBackendWorld world = "jolt".equals(engine)
+            ? new JoltPhysicsWorld(gx, gy, gz)
+            : new NativePhysicsWorld(gx, gy, gz);
+
+        Entry entry = new Entry(key, UUID.randomUUID(), world, gx, gy, gz, recordingId, dimensionKey);
+        entries.put(key, entry);
+        return entry;
+    }
+
+    public static Entry get(String key)
+    {
+        Entry e = entries.get(key);
+        return (e != null && !e.destroyed) ? e : null;
+    }
+
+    /** 该 key 是否已经建立过回放物理世界（applyAction 幂等判定） */
+    public static boolean has(String key)
+    {
+        return get(key) != null;
+    }
+
+    public static int getSimulatedTick(String key)
+    {
+        Entry e = get(key);
+        return e == null ? 0 : e.simulatedTick;
+    }
+
+    /* ================================================================
+     * 驱动（回放时钟）
+     * ================================================================ */
+
+    /**
+     * 把物理世界推进（或回退）到指定的局部 tick
+     *
+     * 由 BlockSplashActionClip#applyRange 每个回放 tick 调用一次。
+     *
+     * @param localTick 目标 tick（相对 clip 起点，>= 0）
+     */
+    public static void driveTo(String key, int localTick)
+    {
+        Entry entry = get(key);
+
+        if (entry == null)
+        {
+            return;
+        }
+
+        if (!entry.world.isValid())
+        {
+            destroy(key);
+            return;
+        }
+
+        // 清理已自行销毁（世界失效）或被外部移除的实体，
+        // 避免它们残留的初始条件被 rewind 重新造出"幽灵刚体"
+        entry.bodies.removeIf(b ->
+        {
+            if (b.entity != null && b.entity.method_31481())
+            {
+                b.handle = 0;
+                return true;
+            }
+
+            return false;
+        });
+
+        if (localTick < 0)
+        {
+            localTick = 0;
+        }
+
+        // === 向后拖动：物理不可逆 → 从初始条件重建后重新模拟 ===
+        if (localTick < entry.simulatedTick)
+        {
+            if (!rewind(entry, localTick))
+            {
+                // 重建失败（native 返回 0）：世界已不可用，直接销毁，避免死循环重试
+                destroy(key);
+                return;
+            }
+        }
+
+        // === 向前推进（带步数预算，防止长时间拖动阻塞服务器） ===
+        int budget = MAX_STEPS_PER_DRIVE;
+
+        while (entry.simulatedTick < localTick && budget-- > 0)
+        {
+            if (!entry.world.isValid())
+            {
+                destroy(key);
+                return;
+            }
+
+            entry.world.stepTick();
+            entry.simulatedTick++;
+        }
+
+        // === 存活管理（由回放时钟计数，暂停时不计寿命） ===
+        if (entry.lifeTicks > 0 && entry.simulatedTick > entry.lifeTicks)
+        {
+            destroy(key);
+        }
+    }
+
+    /**
+     * 重建刚体并重新模拟到目标 tick
+     *
+     * 顺序严格按 bodies 列表（创建顺序），保证与首次模拟完全一致。
+     */
+    private static boolean rewind(Entry entry, int targetTick)
+    {
+        // 1. 先断开所有实体，杜绝重建期间任何 native 访问
+        for (BodyBinding b : entry.bodies)
+        {
+            if (b.entity != null)
+            {
+                b.entity.detachPhysicsWorld();
+            }
+        }
+
+        // 2. 移除所有动态刚体
+        for (BodyBinding b : entry.bodies)
+        {
+            if (b.handle != 0)
+            {
+                entry.world.removeBody(b.handle);
+                b.handle = 0;
+            }
+        }
+
+        // 3. 按初始条件重建（同一顺序 → 确定性）
+        for (BodyBinding b : entry.bodies)
+        {
+            long handle = entry.world.createDynamicBlock(
+                b.x, b.y, b.z, b.mass, b.friction, b.restitution);
+
+            if (handle == 0)
+            {
+                return false;
+            }
+
+            entry.world.setBodyDamping(handle, b.linearDamping, b.angularDamping);
+            entry.world.setBodyVelocity(handle, b.vx, b.vy, b.vz);
+            entry.world.setBodyAngularVelocity(handle, b.avx, b.avy, b.avz);
+            b.handle = handle;
+        }
+
+        // 4. 重新绑定实体
+        for (BodyBinding b : entry.bodies)
+        {
+            if (b.entity != null)
+            {
+                b.entity.setBodyHandle(b.handle, entry.world, entry.worldId);
+            }
+        }
+
+        entry.simulatedTick = 0;
+        return true;
+    }
+
+    /* ================================================================
+     * 销毁
+     * ================================================================ */
+
+    /**
+     * 销毁一个回放物理世界
+     *
+     * 顺序至关重要：
+     *   ① 断开实体 → ② 关闭 native 世界 → ③ 移除实体
+     * 反过来的话，实体在 native 世界释放后仍持有指针（use-after-free）。
+     */
+    public static void destroy(String key)
+    {
+        Entry entry = entries.remove(key);
+
+        if (entry == null || entry.destroyed)
+        {
+            return;
+        }
+
+        entry.destroyed = true;
+
+        List<PhysicsBlockEntity> toRemove = new ArrayList<>();
+
+        for (BodyBinding b : entry.bodies)
+        {
+            if (b.entity != null && !b.entity.method_31481())
+            {
+                b.entity.detachPhysicsWorld();
+                toRemove.add(b.entity);
+            }
+        }
+
+        entry.bodies.clear();
+
+        try
+        {
+            if (entry.world.isValid())
+            {
+                entry.world.close();
+            }
+        }
+        catch (Throwable t)
+        {
+            /* native 层异常不应中断清理 */
+        }
+
+        for (PhysicsBlockEntity entity : toRemove)
+        {
             try
             {
-                if (world.getBodyCount() == 0)
+                entity.method_31472();
+            }
+            catch (Throwable t)
+            {
+                /* 忽略单个实体移除失败 */
+            }
+        }
+
+        if (entry.recordingId != null)
+        {
+            PhysicsRecordingManager.clearRecording(entry.recordingId);
+        }
+
+        // Recovery 记录不在运行时清理（见 BlockSplashRecoveryManager 注释），
+        // 由 SERVER_STOPPING 的 restoreAll + clearAll 负责最终清理。
+    }
+
+    /**
+     * 回放停止时清理该影片的所有物理世界
+     *
+     * 由 ActionPlayer#stop 的 Mixin 钩子调用（BlockSplashReplayHook）。
+     * DamageControl 会在同一时机恢复方块，因此这里只需销毁刚体与实体。
+     */
+    public static void destroyForFilm(String filmId)
+    {
+        if (filmId == null)
+        {
+            return;
+        }
+
+        String prefix = filmId + "@";
+
+        for (Iterator<Map.Entry<String, Entry>> it = entries.entrySet().iterator(); it.hasNext(); )
+        {
+            Map.Entry<String, Entry> e = it.next();
+
+            if (e.getKey().startsWith(prefix))
+            {
+                destroy(e.getKey());
+            }
+        }
+    }
+
+    /**
+     * 每服务端 tick 的轻量维护（不步进物理）
+     *
+     * 只负责：
+     * - 世界失效 → 销毁
+     * - 动态刚体归零（实体已全部移除）→ 销毁
+     * - 绝对超时兜底
+     */
+    public static void maintenance()
+    {
+        for (Iterator<Map.Entry<String, Entry>> it = entries.entrySet().iterator(); it.hasNext(); )
+        {
+            Map.Entry<String, Entry> e = it.next();
+            Entry entry = e.getValue();
+
+            boolean drop = false;
+
+            try
+            {
+                if (!entry.world.isValid())
                 {
-                    world.close();
-                    it.remove();
-                    worldAges.remove(id);
-                    cleanupAssociated(id);
-                    continue;
+                    drop = true;
+                }
+                else if (entry.world.getBodyCount() == 0)
+                {
+                    // 所有刚体已被移除（实体全部 discard）→ 立即销毁，不等超时
+                    drop = true;
+                }
+                else if (entry.simulatedTick > MAX_WORLD_LIFE)
+                {
+                    drop = true;
                 }
             }
             catch (Throwable t)
             {
                 // JNI 异常（DLL 版本不匹配等）：保守起见销毁世界，避免泄漏
-                world.close();
-                it.remove();
-                worldAges.remove(id);
-                cleanupAssociated(id);
-                continue;
+                drop = true;
             }
 
-            // 子步进由后端 stepTick() 内部完成（Rapier 2 子步 / Jolt 3 子步）
-            world.stepTick();
-
-            // 超时销毁
-            int age = worldAges.merge(id, 1, Integer::sum);
-            if (age > MAX_WORLD_LIFE)
+            if (drop)
             {
-                world.close();
-                it.remove();
-                worldAges.remove(id);
-                cleanupAssociated(id);
+                destroy(e.getKey());
             }
         }
     }
 
     /**
-     * 连带清理与 worldId 关联的所有资源
+     * 销毁所有世界（服务器停止 / 世界卸载）
      *
-     * 在世界销毁时调用，清理：
-     * - PhysicsRecordingManager 的物理记录（防止 36 万条/回放 累积）
-     *
-     * 注意：**不清理 BlockSplashRecoveryManager 记录**。
-     * Recovery 记录是"DamageControl 失效时的兜底"，运行时清理不安全——
-     * 世界销毁时 BBS DamageControl 可能还未完成方块恢复。
-     * Recovery 记录的累积量很小（每回放约 12KB，vs PhysicsRecording 43MB），
-     * 不是"越播越卡"的主因。Recovery 记录由 SERVER_STOPPING 的
-     * restoreAll + clearAll 负责最终清理。
-     */
-    private static void cleanupAssociated(UUID worldId)
-    {
-        UUID recordingId = worldRecordingMap.remove(worldId);
-        if (recordingId != null)
-        {
-            PhysicsRecordingManager.clearRecording(recordingId);
-        }
-
-        // 注意：不清理 BlockSplashRecoveryManager（见方法注释）
-        // dimensionKey 映射仍然移除（避免 map 累积），但不触发 Recovery 清理
-        worldDimensionMap.remove(worldId);
-    }
-
-    /**
-     * 销毁指定世界（释放 native 内存 + 连带清理）
-     */
-    public static void destroyWorld(UUID id)
-    {
-        PhysicsBackendWorld world = worlds.remove(id);
-        worldAges.remove(id);
-        if (world != null && world.isValid())
-        {
-            world.close();
-        }
-        cleanupAssociated(id);
-    }
-
-    /**
-     * 销毁所有世界（服务器停止/世界卸载时调用）
-     *
-     * 调用顺序约束（在 BlockSplashAddon.SERVER_STOPPING 中）：
-     * 1. PhysicsWorldRegistry.clearAll()（本方法，销毁物理世界 + 清 PhysicsRecording）
-     * 2. BlockSplashRecoveryManager.restoreAll(server)（用 Recovery 记录恢复方块）
-     * 3. BlockSplashRecoveryManager.clearAll()（清空 Recovery 记录）
-     *
-     * 本方法**不清理** BlockSplashRecoveryManager 记录，否则步骤 2 的 restoreAll
-     * 会找不到记录无法恢复方块。
+     * 调用顺序约束（见 BlockSplashAddon 的 SERVER_STOPPING）：
+     * 1. clearAll()（销毁物理世界 + 清 PhysicsRecording + 移除实体）
+     * 2. BlockSplashRecoveryManager.restoreAll(server)
+     * 3. BlockSplashRecoveryManager.clearAll()
      */
     public static void clearAll()
     {
-        for (PhysicsBackendWorld world : worlds.values())
+        for (String key : new ArrayList<>(entries.keySet()))
         {
-            if (world.isValid())
-            {
-                world.close();
-            }
+            destroy(key);
         }
-        worlds.clear();
-        worldAges.clear();
 
-        // 连带清理所有 PhysicsRecording（每回放 36 万条 ≈ 43MB，必须清）
-        for (UUID recordingId : worldRecordingMap.values())
-        {
-            if (recordingId != null)
-            {
-                PhysicsRecordingManager.clearRecording(recordingId);
-            }
-        }
-        worldRecordingMap.clear();
-        worldDimensionMap.clear();
+        entries.clear();
+        PhysicsRecordingManager.clearAll();
+    }
 
-        // 注意：不调用 BlockSplashRecoveryManager.clearWorldByKey
-        // Recovery 记录由 SERVER_STOPPING 的 restoreAll + clearAll 负责
+    public static int getActiveWorldCount()
+    {
+        return entries.size();
     }
 
     /**
-     * 获取当前活跃世界数量（调试用）
+     * @deprecated 物理已改由回放时钟驱动（见 driveTo）。保留仅为兼容旧调用方，
+     *             行为等价于 maintenance()，不会推进物理。
      */
-    public static int getActiveWorldCount()
+    @Deprecated
+    public static void tickAll(double dt)
     {
-        return worlds.size();
+        maintenance();
+    }
+
+    /** 兼容旧签名：返回首个（也是唯一的默认）世界，供调试与旧代码编译 */
+    @Deprecated
+    public static NativePhysicsWorld createWorld(UUID id)
+    {
+        return createWorld(id, 0.0, -11.0, 0.0);
+    }
+
+    @Deprecated
+    public static NativePhysicsWorld createWorld(UUID id, double gx, double gy, double gz)
+    {
+        return new NativePhysicsWorld(gx, gy, gz);
+    }
+
+    @Deprecated
+    public static NativePhysicsWorld createWorld(UUID id, double gx, double gy, double gz,
+                                                 UUID recordingId, class_5321<class_1937> dimensionKey)
+    {
+        return new NativePhysicsWorld(gx, gy, gz);
+    }
+
+    @Deprecated
+    public static PhysicsBackendWorld createWorld(UUID id, double gx, double gy, double gz,
+                                                  UUID recordingId, class_5321<class_1937> dimensionKey,
+                                                  String engine)
+    {
+        return "jolt".equals(engine) ? new JoltPhysicsWorld(gx, gy, gz) : new NativePhysicsWorld(gx, gy, gz);
+    }
+
+    @Deprecated
+    public static PhysicsBackendWorld getWorld(UUID id)
+    {
+        return null;
+    }
+
+    @Deprecated
+    public static void destroyWorld(UUID id)
+    {
+        /* 由 key 管理，UUID 入口已废弃 */
     }
 }
