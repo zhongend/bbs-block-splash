@@ -996,6 +996,53 @@ matrices.pop();
 
 在 IDE 里导入完整 Gradle 工程（Loom 会自动附加 Yarn 映射）后即可看到可读名；本仓库按原始版本保留 intermediary 名以忠实还原源码包。
 
+### 13.2.1 ⚠️ 铁律：Mixin 注解里的成员名也必须写 intermediary 名
+
+**这是本仓库最容易踩、且后果最隐蔽的坑。**
+
+Loom 的 Mixin 注解处理器靠映射文件里的 `named` 命名空间，把
+`@Inject(method = "tick")` 翻译成 `method_5773` 并写进 **refmap**。
+而 `net.fabricmc:intermediary` 只有 `official` / `intermediary` 两个命名空间，**没有 `named`**
+—— 处理器查不到，只能把字符串原样保留，**refmap 也生成不出来**。
+
+| 症状 | 说明 |
+|---|---|
+| 构建**成功**、jar 正常产出 | 没有任何编译错误，只打印一行 `Cannot remap tick because it does not exist...` 警告，极易被忽略 |
+| 产物里 `@Inject(method = "tick")` 原样保留 | 但运行时 `class_1540` 的方法叫 `method_5773` → 按名字 `"tick"` 找不到目标 |
+| 因为 `mixins.json` 是 `"required": true` + `defaultRequire: 1` | **直接抛 InjectionError，游戏启动崩溃** |
+
+正确写法（本仓库当前状态）：
+
+```java
+@Inject(method = "method_5773", ...)                    // FallingBlockEntity.tick()
+@Inject(method = "method_24828", ...)                   // Entity.isOnGround()
+@Inject(method = "method_3965", ...)                    // FallingBlockEntityRenderer.render()
+@Inject(method = "method_5693", ...)                    // Entity.initDataTracker()
+@Accessor("field_7192") int bbs$getTimeFalling();       // FallingBlockEntity.timeFalling
+@Accessor("field_7188") BlockState bbs$getBlock();      // FallingBlockEntity.block
+@Accessor("field_5952") boolean bbs$isOnGround();       // Entity.onGround
+@Accessor("field_6014" / "field_6036" / "field_5969")   // Entity.prevX / prevY / prevZ
+```
+
+**BBS 模组（`mchorse.bbs_mod.*`）的类没有被重映射**，所以针对 BBS 的 Mixin 注解
+一律写真实名（`@Inject(method = "stop")`、`@Accessor("list")`、`@Inject(method = "render")`
+指向 `UIReplaysListPanel`），**不要"顺手统一"成 `method_XXXX`**。
+
+查法（intermediary ↔ yarn 对照）：
+
+```bash
+curl -O https://maven.fabricmc.net/net/fabricmc/yarn/1.20.1+build.10/yarn-1.20.1+build.10-v2.jar
+unzip yarn-*.jar mappings/mappings.tiny      # tiny v2：intermediary  named
+```
+
+构建后自检（确认注解真的被写成了中间名）：
+
+```bash
+javap -v -p build/classes/java/main/.../mixin/FallingBlockEntityPhysicsMixin.class \
+  | grep -A 3 "injection.Inject(" | grep "method="
+# 期望：method=["method_5773"]   而不是 method=["tick"]
+```
+
 ### 13.3 重新构建（build.gradle 已随仓库提供，编译已验证）
 
 仓库已包含完整 Gradle 构建（`build.gradle` / `settings.gradle` / `gradle.properties` / Gradle 9.2.0 wrapper）与编译验证工具（`buildscript/`）：

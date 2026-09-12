@@ -30,7 +30,7 @@ public abstract class FallingBlockEntityDataMixin
     /**
      * 在 initDataTracker 末尾注入，注册旋转字段
      */
-    @Inject(method = "initDataTracker", at = @At("RETURN"))
+    @Inject(method = "method_5693", at = @At("RETURN"))
     private void onInitDataTracker(CallbackInfo ci)
     {
         class_1540 self = (class_1540) (Object) this;

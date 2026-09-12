@@ -24,7 +24,36 @@ dependencies {
 	/* 本插件源码以 intermediary（中间）命名书写（与发布的 sources jar 一致），
 	 * 所以开发映射直接使用 intermediary——Loom 会把 Minecraft 重映射为
 	 * intermediary 名称，编译时所见即所得，产物无需再映射。
-	 * 注意：使用 yarn 的标准工程请先把源码 remap 回 yarn 再改回。 */
+	 * 注意：使用 yarn 的标准工程请先把源码 remap 回 yarn 再改回。
+	 *
+	 * ⚠️⚠️ 铁律：Mixin 注解里的成员名也必须写 intermediary 名（method_XXXX / field_XXXX）⚠️⚠️
+	 *
+	 * 原因：Loom 的 Mixin 注解处理器靠映射文件里的 "named" 命名空间把
+	 * `@Inject(method = "tick")` 翻译成 `method_5773`，并写进 refmap。
+	 * 而 net.fabricmc:intermediary 只有 official/intermediary 两个命名空间，
+	 * 没有 named —— 于是处理器查不到，只能原样保留字符串，也生成不出 refmap。
+	 *
+	 * 后果极其隐蔽：构建成功、jar 也能打出来，但运行时 Minecraft 类的方法叫
+	 * method_5773，注入按名字 "tick" 找不到目标 → 由于 mixins.json 里
+	 * "required": true + defaultRequire: 1，会直接抛 InjectionError 启动崩溃。
+	 *
+	 * 所以写法是：
+	 *   @Inject(method = "method_5773", at = @At("HEAD"))      // FallingBlockEntity.tick()
+	 *   @Inject(method = "method_24828", ...)                  // Entity.isOnGround()
+	 *   @Inject(method = "method_3965", ...)                   // FallingBlockEntityRenderer.render()
+	 *   @Inject(method = "method_5693", ...)                   // Entity.initDataTracker()
+	 *   @Accessor("field_7192") int bbs$getTimeFalling();      // FallingBlockEntity.timeFalling
+	 *   @Accessor("field_7188") ... bbs$getBlock();            // FallingBlockEntity.block
+	 *   @Accessor("field_5952") ...                            // Entity.onGround
+	 *   @Accessor("field_6014" / "field_6036" / "field_5969")  // Entity.prevX / prevY / prevZ
+	 *
+	 * 查法（intermediary ↔ yarn 对照）：
+	 *   curl -O https://maven.fabricmc.net/net/fabricmc/yarn/1.20.1+build.10/yarn-1.20.1+build.10-v2.jar
+	 *   unzip yarn-*.jar mappings/mappings.tiny   # tiny v2：intermediary  named
+	 *
+	 * BBS 模组（mchorse.bbs_mod.*）的类**没有**被重映射，所以针对 BBS 的
+	 * Mixin 注解一律写真实名字（如 @Inject(method = "stop")、@Accessor("list")），
+	 * 不要"顺手统一"成 method_XXXX。 */
 	mappings "net.fabricmc:intermediary:${project.minecraft_version}:v2"
 	modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
 	modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"

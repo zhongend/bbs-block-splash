@@ -66,7 +66,7 @@ public abstract class FallingBlockEntityRendererMixin
     /**
      * 在 render 方法开始时注入，应用旋转和挤压变形
      */
-    @Inject(method = "render", at = @At("HEAD"))
+    @Inject(method = "method_3965", at = @At("HEAD"))
     private void onRender(
         class_1540 entity,
         float yaw,
@@ -233,7 +233,7 @@ public abstract class FallingBlockEntityRendererMixin
     /**
      * 在 render 方法结束时 pop 矩阵栈
      */
-    @Inject(method = "render", at = @At("RETURN"))
+    @Inject(method = "method_3965", at = @At("RETURN"))
     private void onRenderEnd(
         class_1540 entity,
         float yaw,

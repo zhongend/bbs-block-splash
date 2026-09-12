@@ -35,27 +35,27 @@ import org.spongepowered.asm.mixin.gen.Accessor;
 public interface EntityAccessor
 {
     /* 注意：方法名不能叫 isOnGround()（与 vanilla 方法冲突，@Accessor 会失效） */
-    @Accessor("onGround")
+    @Accessor("field_5952")
     boolean bbs$isOnGround();
 
-    @Accessor("onGround")
+    @Accessor("field_5952")
     void bbs$setOnGround(boolean value);
 
-    @Accessor("prevX")
+    @Accessor("field_6014")
     double getPrevX();
 
-    @Accessor("prevX")
+    @Accessor("field_6014")
     void setPrevX(double value);
 
-    @Accessor("prevY")
+    @Accessor("field_6036")
     double getPrevY();
 
-    @Accessor("prevY")
+    @Accessor("field_6036")
     void setPrevY(double value);
 
-    @Accessor("prevZ")
+    @Accessor("field_5969")
     double getPrevZ();
 
-    @Accessor("prevZ")
+    @Accessor("field_5969")
     void setPrevZ(double value);
 }

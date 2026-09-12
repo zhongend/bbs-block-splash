@@ -4,7 +4,6 @@ import com.example.bbsanimatedbreak.BlockSplashRecoveryManager;
 import com.example.bbsanimatedbreak.FallingBlockRotationData;
 import com.example.bbsanimatedbreak.RotatingFallingBlockManager;
 import org.spongepowered.asm.mixin.Mixin;
-import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
@@ -48,21 +47,21 @@ import net.minecraft.class_2680;
 @Mixin(class_1540.class)
 public abstract class FallingBlockEntityPhysicsMixin
 {
-    /** FallingBlockEntity.timeFalling 字段（public int） */
-    @Shadow public int timeFalling;
-
     /**
      * HEAD 注入：非实体化方块重置 timeFalling，防止原版 600 tick 超时移除
      *
      * 注意：原版 FallingBlockEntity.tick() 的"落地变方块"条件是
      *   isOnGround() || concreteInWater
      * （不检查 timeFalling！），所以重置 timeFalling 不能阻止变方块。
-     * 阻止变方块由 BbsEntityMixin 的 @Inject isOnGround() 完成。
+     * 阻止变方块由 BbsEntityMixin 的 @Inject method_24828() 完成。
      *
      * 这里重置 timeFalling 的作用：防止原版"未落地且 timeFalling > 600"时
      * 触发的 dropItem + discard 超时移除逻辑（让方块能存活到调度器指定时长）。
+     *
+     * timeFalling 的读写改走 FallingBlockEntityAccessor（@Accessor("field_7192")），
+     * 不再用 @Shadow —— 理由见该接口的注释。
      */
-    @Inject(method = "tick", at = @At("HEAD"))
+    @Inject(method = "method_5773", at = @At("HEAD"))
     private void resetTimeFallingForNoSolidify(CallbackInfo ci)
     {
         class_1540 self = (class_1540) (Object) this;
@@ -75,7 +74,7 @@ public abstract class FallingBlockEntityPhysicsMixin
         {
             if (self.method_5841().method_12789(FallingBlockRotationData.NO_SOLIDIFY))
             {
-                this.timeFalling = 0;
+                ((FallingBlockEntityAccessor) self).bbs$setTimeFalling(0);
             }
         }
         catch (Exception e)
@@ -87,7 +86,7 @@ public abstract class FallingBlockEntityPhysicsMixin
     /**
      * 在 tick() 末尾注入物理逻辑
      */
-    @Inject(method = "tick", at = @At("RETURN"))
+    @Inject(method = "method_5773", at = @At("RETURN"))
     private void onTickEnd(CallbackInfo ci)
     {
         class_1540 self = (class_1540) (Object) this;

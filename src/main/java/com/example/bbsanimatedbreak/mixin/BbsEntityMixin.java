@@ -37,7 +37,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 @Mixin(class_1297.class)
 public abstract class BbsEntityMixin
 {
-    @Inject(method = "isOnGround", at = @At("HEAD"), cancellable = true)
+    @Inject(method = "method_24828", at = @At("HEAD"), cancellable = true)
     private void bbs$noSolidifyIsOnGround(CallbackInfoReturnable<Boolean> cir)
     {
         class_1297 self = (class_1297) (Object) this;

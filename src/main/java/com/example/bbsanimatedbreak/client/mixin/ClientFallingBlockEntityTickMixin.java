@@ -37,7 +37,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 @Mixin(class_1540.class)
 public abstract class ClientFallingBlockEntityTickMixin
 {
-    @Inject(method = "tick", at = @At("HEAD"), cancellable = true)
+    @Inject(method = "method_5773", at = @At("HEAD"), cancellable = true)
     private void skipTickForPathMovement(CallbackInfo ci)
     {
         class_1540 self = (class_1540) (Object) this;
